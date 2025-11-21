@@ -1,0 +1,22 @@
+online:
+python -m EAGLE-online.eagle.evaluation.gen_ea_answer_llama3chat \
+--ea-model-path model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/ \
+--base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
+--use_eagle3 \
+--enable-online-adaptation \
+--model-id {id}
+
+baseline:
+python -m EAGLE.eagle.evaluation.gen_ea_answer_llama3chat \
+--ea-model-path model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/ \
+--base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
+--use_eagle3 \
+--model-id {id}
+
+outside:
+/mt_bench
+/mt_bench_online
+/model_weight: download from github
+
+need to modify:
+visibile gpu ids in gen_ea_answer_llama3chat.py

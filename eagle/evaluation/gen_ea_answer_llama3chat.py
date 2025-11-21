@@ -8,7 +8,7 @@ import json
 import os
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
-# os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 from accelerate.utils import set_seed
 set_seed(0)
 
@@ -115,6 +115,14 @@ def get_model_answers(
         use_eagle3=args.use_eagle3,
     )
 
+    if args.enable_online_adaptation:
+        model.setup_online_adaptation(
+            adaptation_lr=args.adaptation_lr,
+            adaptation_steps=args.adaptation_steps,
+            adaptation_temperature=args.adaptation_temperature
+        )
+        print(f"Online adaptation enabled with lr={args.adaptation_lr}, steps={args.adaptation_steps}")
+
     tokenizer = model.get_tokenizer()
 
     if temperature > 1e-5:
@@ -164,6 +172,10 @@ def get_model_answers(
                 temperature=temperature,
                 log=True,
                 is_llama3=True,
+                enable_adaptation=args.enable_online_adaptation,  # online
+                adaptation_lr=args.adaptation_lr,
+                adaptation_steps=args.adaptation_steps,
+                adaptation_temperature=args.adaptation_temperature
             )
             torch.cuda.synchronize()
             total_time = time.time() - start_time
@@ -213,7 +225,7 @@ def get_model_answers(
     # questions=questions[6:]
     for question in tqdm(questions):
 
-        choices = []
+        choices = []    
         for i in range(num_choices):
             torch.manual_seed(i)
             messages = [
@@ -246,6 +258,10 @@ def get_model_answers(
                     temperature=temperature,
                     log=True,
                     is_llama3=True,
+                    enable_adaptation=args.enable_online_adaptation,  # online
+                    adaptation_lr=args.adaptation_lr,
+                    adaptation_steps=args.adaptation_steps,
+                    adaptation_temperature=args.adaptation_temperature
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
@@ -408,6 +424,10 @@ if __name__ == "__main__":
         "--use_eagle3",
         action="store_true"
     )
+    parser.add_argument("--enable-online-adaptation", action="store_true")
+    parser.add_argument("--adaptation-lr", type=float, default=0.001)
+    parser.add_argument("--adaptation-steps", type=int, default=1)
+    parser.add_argument("--adaptation-temperature", type=float, default=1.0)
 
     args = parser.parse_args()
 
@@ -424,7 +444,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}/{args.model_id}.jsonl"
+        answer_file = f"{args.bench_name}_online/{args.model_id}.jsonl"
 
     print(f"Output to {answer_file}")
 

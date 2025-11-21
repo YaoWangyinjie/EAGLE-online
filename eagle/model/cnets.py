@@ -673,6 +673,7 @@ class Model(nn.Module):
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
+        device = hidden_states.device
 
         sample_token = input_ids[:, -1]
 
@@ -709,11 +710,15 @@ class Model(nn.Module):
             ss_token.append(topk_index)
             input_ids = topk_index
         else:
-            ss_token.append(topk_index+self.d2t[topk_index])
-            input_ids = topk_index+self.d2t[topk_index]
+            topk_index_cpu = topk_index.cpu()
+            d2t_mapped = self.d2t[topk_index_cpu].to(device)
+            mapped_tokens = topk_index + d2t_mapped
+            ss_token.append(mapped_tokens)
+            input_ids = mapped_tokens
+
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        topk_cs_index = torch.arange(top_k, device=device)
 
         # 4
         for i in range(depth):
@@ -751,8 +756,13 @@ class Model(nn.Module):
             if self.config.vocab_size == self.config.draft_vocab_size:
                 ss_token.append(topk_index)
             else:
-                input_ids = input_ids + self.d2t[input_ids]
-                ss_token.append(topk_index+self.d2t[topk_index])
+                input_ids_cpu = input_ids.cpu()
+                d2t_mapped = self.d2t[input_ids_cpu].to(device)
+                input_ids = input_ids + d2t_mapped
+                topk_index_cpu = topk_index.cpu()
+                d2t_mapped_topk = self.d2t[topk_index_cpu].to(device)
+                ss_token.append(topk_index + d2t_mapped_topk)
+
             scores_list.append(cu_scores)
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
 
