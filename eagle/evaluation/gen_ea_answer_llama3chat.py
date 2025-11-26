@@ -27,6 +27,7 @@ except:
     from eagle.model.kv_cache import initialize_past_key_values
     from eagle.model.utils import *
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
 def run_eval(
@@ -85,8 +86,6 @@ def run_eval(
     if use_ray:
         ray.get(ans_handles)
 
-
-@torch.inference_mode()
 def get_model_answers(
         base_model_path,
         ea_model_path,

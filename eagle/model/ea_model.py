@@ -20,6 +20,7 @@ from .kv_cache import initialize_past_key_values
 from .cnets import Model
 from .cnets1 import Model as Model1
 from .configs import EConfig
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
 class EaModel(nn.Module):
@@ -164,43 +165,48 @@ class EaModel(nn.Module):
                 return 0.0
             
             accepted_tokens_filtered = accepted_tokens_cpu[valid_token_mask]
-            valid_mask_cpu = t2d_cpu[accepted_tokens_filtered]
-            valid_mask = valid_mask_cpu.to(device)
-
-            if not valid_mask.any():
+            
+            draft_indices = t2d_cpu[accepted_tokens_filtered]
+            valid_draft_mask = (draft_indices >= 0) & (draft_indices < self.draft_vocab_size)
+            
+            if not valid_draft_mask.any():
                 self.ea_layer.eval()
                 return 0.0
 
-            valid_positions = torch.where(valid_mask_cpu)[0].to(device)
-            if len(valid_positions) == 0:
+            valid_token_indices = torch.where(valid_token_mask)[0]  
+            final_valid_indices = valid_token_indices[valid_draft_mask]  
+            
+            if len(final_valid_indices) == 0:
                 self.ea_layer.eval()
                 return 0.0
 
             if accepted_indices.device != device:
                 accepted_indices = accepted_indices.to(device)
         
-            valid_accepted_indices = accepted_indices[:-1][valid_positions]
+            valid_accepted_indices = accepted_indices[:-1][final_valid_indices.to(device)]
             
             if len(valid_accepted_indices) == 0:
                 self.ea_layer.eval()
                 return 0.0
-    
+
             max_idx = hidden_state_new.shape[1] - 1
-            valid_accepted_indices = valid_accepted_indices[valid_accepted_indices <= max_idx]
+            valid_hidden_mask = valid_accepted_indices <= max_idx
+            valid_accepted_indices = valid_accepted_indices[valid_hidden_mask]
+            final_valid_indices = final_valid_indices[valid_hidden_mask.cpu()]
+            
+            if len(valid_accepted_indices) == 0:
+                self.ea_layer.eval()
+                return 0.0
             
             input_hidden = hidden_state_new[:, valid_accepted_indices].detach()
-            target_logits_filtered = target_logits[valid_indices]
-
-            if len(valid_positions) > len(valid_accepted_indices):
-                valid_positions = valid_positions[:len(valid_accepted_indices)]
-            target_logits_filtered = target_logits[valid_positions]
+            target_logits_filtered = target_logits[final_valid_indices]
             
             batch_size = target_logits_filtered.shape[0]
             seq_len = target_logits_filtered.shape[1] if target_logits_filtered.dim() > 2 else 1
         
             if target_logits_filtered.dim() == 2:
                 target_logits_filtered = target_logits_filtered.unsqueeze(0)
-
+            
             mapped_target_logits = torch.full(
                 (batch_size, seq_len, self.draft_vocab_size), 
                 float('-inf'), 
@@ -227,6 +233,10 @@ class EaModel(nn.Module):
             max_idx = hidden_state_new.shape[1] - 1
             indices_to_use = indices_to_use[indices_to_use <= max_idx]
             
+            if len(indices_to_use) == 0:
+                self.ea_layer.eval()
+                return 0.0
+            
             input_hidden = hidden_state_new[:, indices_to_use].detach()
             if target_logits.shape[-1] > self.draft_vocab_size:
                 mapped_target_logits = target_logits[..., :self.draft_vocab_size]
@@ -234,15 +244,28 @@ class EaModel(nn.Module):
                 mapped_target_logits = target_logits
 
         mapped_target_logits = mapped_target_logits.detach()
+        
         if input_hidden.dim() == 3 and input_hidden.shape[0] == 1:
             input_hidden = input_hidden.squeeze(0)
-
+        
+        if mapped_target_logits.dim() == 3 and mapped_target_logits.shape[0] == 1:
+            mapped_target_logits = mapped_target_logits.squeeze(0)
+        
+        if input_hidden.dim() == 2 and mapped_target_logits.dim() == 2:
+            min_len = min(input_hidden.shape[0], mapped_target_logits.shape[0])
+            input_hidden = input_hidden[:min_len]
+            mapped_target_logits = mapped_target_logits[:min_len]
+        
+        if mapped_target_logits.shape[-1] > self.draft_vocab_size:
+            mapped_target_logits = mapped_target_logits[..., :self.draft_vocab_size]
+        
         total_loss = 0.0
+        temp = max(self.adaptation_temperature, 1e-5)
         
         for _ in range(self.adaptation_steps):
             self.adapter_optimizer.zero_grad()
+            
             # forward draft model
-            # base model hidden states
             if hasattr(self.ea_layer, 'fc'):
                 draft_hidden = self.ea_layer.fc(input_hidden)
             else:
@@ -251,24 +274,26 @@ class EaModel(nn.Module):
             # get predictions of draft model for tokens
             draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden))
 
-            if draft_logits.shape[:-1] != mapped_target_logits.shape[:-1]:
-                if draft_logits.dim() == 2 and mapped_target_logits.dim() == 2:
-                    min_len = min(draft_logits.shape[0], mapped_target_logits.shape[0])
-                    draft_logits = draft_logits[:min_len]
-                    mapped_target_logits = mapped_target_logits[:min_len]
+            draft_logits_batch = draft_logits
+            target_logits_batch = mapped_target_logits
+            
+            if draft_logits_batch.dim() == 3 and draft_logits_batch.shape[0] == 1:
+                draft_logits_batch = draft_logits_batch.squeeze(0)
+            
+            if draft_logits_batch.shape[:-1] != target_logits_batch.shape[:-1]:
+                if draft_logits_batch.dim() == 2 and target_logits_batch.dim() == 2:
+                    min_len = min(draft_logits_batch.shape[0], target_logits_batch.shape[0])
+                    draft_logits_batch = draft_logits_batch[:min_len]
+                    target_logits_batch = target_logits_batch[:min_len]
                 else:
                     self.ea_layer.eval()
                     return 0.0
         
-            if draft_logits.shape[-1] > self.draft_vocab_size:
-                draft_logits = draft_logits[..., :self.draft_vocab_size]
-
-            temp = self.adaptation_temperature
-            if temp < 1e-5:
-                temp = 1e-5 
+            if draft_logits_batch.shape[-1] > self.draft_vocab_size:
+                draft_logits_batch = draft_logits_batch[..., :self.draft_vocab_size]
             
-            log_probs = F.log_softmax(draft_logits / temp, dim=-1)
-            target_probs = F.softmax(mapped_target_logits / temp, dim=-1)
+            log_probs = F.log_softmax(draft_logits_batch / temp, dim=-1)
+            target_probs = F.softmax(target_logits_batch / temp, dim=-1)
             
             epsilon = 1e-10
             target_probs = target_probs + epsilon
@@ -401,7 +426,6 @@ class EaModel(nn.Module):
         else:
             return outputs, hidden_states
 
-    @torch.no_grad()
     def eagenerate(
             self,
             input_ids,
@@ -447,82 +471,86 @@ class EaModel(nn.Module):
         input_ids = input_ids.clone()
         self.ea_layer.reset_kv()
 
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
+        with torch.no_grad():
+            if hasattr(self, "past_key_values"):
+                past_key_values = self.past_key_values
+                past_key_values_data = self.past_key_values_data
+                current_length_data = self.current_length_data
+                current_length_data.zero_()
+            else:
+                (
+                    past_key_values,
+                    past_key_values_data,
+                    current_length_data,
+                ) = initialize_past_key_values(self.base_model,max_length=max_length)
+                self.past_key_values = past_key_values
+                self.past_key_values_data = past_key_values_data
+                self.current_length_data = current_length_data
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         # prefill
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
-        )
+        with torch.no_grad():
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+                input_ids, self, past_key_values, logits_processor
+            )
+
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
-            self.base_model.model.tree_mask = tree_mask
+            with torch.no_grad():
+                self.base_model.model.tree_mask = tree_mask
 
-            draft_tokens = draft_tokens.to(input_ids.device)
-            logits, hidden_state_new, outputs = tree_decoding(
-                self,
-                draft_tokens,
-                past_key_values,
-                tree_position_ids,
-                input_ids,
-                retrieve_indices,
-            )
-
-            draft_tokens = torch.cat((draft_tokens, padding), dim=1)
-            candidates = draft_tokens[0, retrieve_indices]
-            best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
-            )
-
-            if use_adaptation and accept_length > 0 and self.adapter_optimizer is not None and not self.first_token_adapted: 
-                # collect data for online adaptation
-                accepted_indices = retrieve_indices[best_candidate, :accept_length+1]
-                    
-                adapt_loss = self._perform_online_adaptation(
-                    input_ids=input_ids,
-                    candidates=candidates,
-                    retrieve_indices=retrieve_indices,
-                    best_candidate=best_candidate,
-                    accept_length=accept_length,
-                    hidden_state_new=hidden_state_new,
-                    logits=logits
+                draft_tokens = draft_tokens.to(input_ids.device)
+                logits, hidden_state_new, outputs = tree_decoding(
+                    self,
+                    draft_tokens,
+                    past_key_values,
+                    tree_position_ids,
+                    input_ids,
+                    retrieve_indices,
                 )
-                
-                if adapt_loss is not None and adapt_loss > 0:
-                    adaptation_info['losses'].append(adapt_loss)
-                    adaptation_info['accept_lengths'].append(accept_length)
-                    adaptation_info['adaptation_count'] += 1
+
+                draft_tokens = torch.cat((draft_tokens, padding), dim=1)
+                candidates = draft_tokens[0, retrieve_indices]
+                best_candidate, accept_length, sample_p = evaluate_posterior(
+                    logits, candidates, logits_processor
+                )
+
+            if use_adaptation and self.adapter_optimizer is not None and not self.first_token_adapted: 
+                if accept_length > 0:
+                    adapt_loss = self._perform_online_adaptation(
+                        input_ids=input_ids,
+                        candidates=candidates,
+                        retrieve_indices=retrieve_indices,
+                        best_candidate=best_candidate,
+                        accept_length=accept_length,
+                        hidden_state_new=hidden_state_new,
+                        logits=logits
+                    )
+                    
+                    if adapt_loss is not None and adapt_loss > 0:
+                        adaptation_info['losses'].append(adapt_loss)
+                        adaptation_info['accept_lengths'].append(accept_length)
+                        adaptation_info['adaptation_count'] += 1
+
                     self.first_token_adapted = True
 
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
-                input_ids,
-                candidates,
-                best_candidate,
-                accept_length,
-                retrieve_indices,
-                logits_processor,
-                new_token,
-                past_key_values_data,
-                current_length_data,
-                self,
-                hidden_state_new,
-                sample_p
-            )
+            with torch.no_grad():
+                input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+                    input_ids,
+                    candidates,
+                    best_candidate,
+                    accept_length,
+                    retrieve_indices,
+                    logits_processor,
+                    new_token,
+                    past_key_values_data,
+                    current_length_data,
+                    self,
+                    hidden_state_new,
+                    sample_p
+                )
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -537,270 +565,9 @@ class EaModel(nn.Module):
 
         # print online info
         if use_adaptation and adaptation_info['adaptation_count'] > 0:
-            if adaptation_info['adaptation_count'] == 1:
-                print(f"Single adaptation performed: loss={adaptation_info['losses'][0]:.4f}, accept_length={adaptation_info['accept_lengths'][0]}")
-            else:
-                avg_loss = sum(adaptation_info['losses']) / len(adaptation_info['losses'])
-                avg_accept = sum(adaptation_info['accept_lengths']) / len(adaptation_info['accept_lengths'])
-                print(f"Adaptation stats: avg_loss={avg_loss:.4f}, avg_accept_length={avg_accept:.2f}, count={adaptation_info['adaptation_count']}")
+                print(f"[Online Adaptation] loss={adaptation_info['losses'][0]:.4f}, accept_length={adaptation_info['accept_lengths'][0]}")
 
         if not log:
             return input_ids
         else:
             return input_ids, new_token, idx
-
-    @torch.no_grad()
-    def naivegenerate(
-            self,
-            input_ids,
-            temperature=0.0,
-            top_p=0.0,
-            top_k=0.0,
-            max_new_tokens=512,
-            max_length=2048,
-            log=False,
-            is_llama3=False,
-
-    ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
-        outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
-        new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
-            if logits_processor is not None:
-                logits = outputs.logits[:, -1]
-                logits = logits_processor(None, logits)
-                probabilities = torch.nn.functional.softmax(logits, dim=-1)
-                input_id = torch.multinomial(probabilities, 1)
-            else:
-                input_id = outputs.logits[:, -1:].argmax(dim=-1)
-            outputs = self.base_model(input_id, use_cache=True, past_key_values=past_key_values)
-            input_ids = torch.cat([input_ids, input_id], dim=-1)
-            new_token += 1
-
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-                break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
-                break
-        if not log:
-            return input_ids
-        else:
-            return input_ids, new_token, idx
-
-    @torch.no_grad()
-    def ea_generate(
-            self,
-            input_ids,
-            temperature=0.0,
-            top_p=0.0,
-            top_k=0.0,
-            max_new_tokens=512,
-            max_length=2048,
-            log=False,
-            is_llama3=False,
-
-    ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
-        )
-        new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
-            # with Timer("all"):
-            self.base_model.model.tree_mask = tree_mask
-
-            draft_tokens = draft_tokens.to(input_ids.device)
-            # with Timer("tree_decoding"):
-            logits, hidden_state_new, outputs = tree_decoding(
-                self,
-                draft_tokens,
-                past_key_values,
-                tree_position_ids,
-                input_ids,
-                retrieve_indices,
-            )
-            # retrieve_indices=tree_buffers["retrieve_indices"]
-            # logits = logits[0, retrieve_indices]
-            draft_tokens = torch.cat((draft_tokens, padding), dim=1)
-            candidates = draft_tokens[0, retrieve_indices]
-            best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
-            )
-            # print(accept_length)
-            # with Timer("update_inference_inputs"):
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
-                input_ids,
-                candidates,
-                best_candidate,
-                accept_length,
-                retrieve_indices,
-                logits_processor,
-                new_token,
-                past_key_values_data,
-                current_length_data,
-                self,
-                hidden_state_new,
-                sample_p
-            )
-
-            yield input_ids
-
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-                break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
-                break
-
-    @torch.no_grad()
-    def naive_generate(
-            self,
-            input_ids,
-            temperature=0.0,
-            top_p=0.0,
-            top_k=0.0,
-            max_new_tokens=512,
-            max_length=2048,
-            log=False,
-            is_llama3=False,
-
-    ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
-        outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
-        new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
-            if logits_processor is not None:
-                logits = outputs.logits[:, -1]
-                logits = logits_processor(None, logits)
-                probabilities = torch.nn.functional.softmax(logits, dim=-1)
-                input_id = torch.multinomial(probabilities, 1)
-            else:
-                input_id = outputs.logits[:, -1:].argmax(dim=-1)
-
-            outputs = self.base_model(input_id, use_cache=True, past_key_values=past_key_values)
-            input_ids = torch.cat([input_ids, input_id], dim=-1)
-            new_token += 1
-
-            yield input_ids
-
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-                break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
-                break

@@ -4,7 +4,7 @@ python -m EAGLE-online.eagle.evaluation.gen_ea_answer_llama3chat \
 --base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
 --use_eagle3 \
 --enable-online-adaptation \
---model-id {id}
+--model-id 1
 
 baseline:
 python -m EAGLE.eagle.evaluation.gen_ea_answer_llama3chat \
