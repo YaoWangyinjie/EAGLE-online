@@ -17,12 +17,13 @@ outside:
 /mt_bench
 /mt_bench_online
 /model_weight: download from github
+/analysis_report
 
-need to modify:
-visibile gpu ids in gen_ea_answer_llama3chat.py
+每次clone后修改：
+gen_ea_answer_llama3chat.py中可用gpu数量
 配置debug
 
-会导致变化的地方：
+处理任务：
 learning rate, temperature, layer
 持续累积的adapter与question权重
 
