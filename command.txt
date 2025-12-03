@@ -20,3 +20,10 @@ outside:
 
 need to modify:
 visibile gpu ids in gen_ea_answer_llama3chat.py
+配置debug
+
+会导致变化的地方：
+learning rate, temperature, layer
+持续累积的adapter与question权重
+
+观察acceptance rate;用张量替代循环
