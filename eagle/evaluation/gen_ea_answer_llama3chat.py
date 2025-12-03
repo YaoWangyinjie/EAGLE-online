@@ -27,9 +27,6 @@ except:
     from eagle.model.kv_cache import initialize_past_key_values
     from eagle.model.utils import *
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
-
 def run_eval(
         base_model_path,
         ea_model_path,
