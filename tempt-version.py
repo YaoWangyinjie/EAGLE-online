@@ -47,9 +47,8 @@ class EaModel(nn.Module):
         self.use_eagle3 = use_eagle3
 
         self.enable_online_adaptation = False # use online or not
-        self.adaptation_steps = 1 # iteration steps
-        self.adaptation_lr = 0.001 # learning rate
-        self.adaptation_temperature = 1.0
+        self.adaptation_lr = 5e-5 # learning rate
+        self.adaptation_temperature = 2.0
         self.adapter_optimizer = None
         self.first_token_adapted = False # one-step flag
 
@@ -103,35 +102,33 @@ class EaModel(nn.Module):
 
     def setup_online_adaptation(
             self, 
-            adaptation_lr=0.001, 
-            adaptation_steps=1, 
-            adaptation_temperature=1.0,
-            adaptation_layers=3
+            adaptation_lr=5e-5, 
+            adaptation_temperature=2.0
         ):
         """superparams of online adaptation"""
         self.enable_online_adaptation = True
         self.adaptation_lr = adaptation_lr
-        self.adaptation_steps = adaptation_steps
         self.adaptation_temperature = adaptation_temperature
         self.first_token_adapted = False
         
         for param in self.ea_layer.parameters():
-            param.requires_grad = False
-        adapt_params = []
-        for name, param in self.ea_layer.named_parameters():
-            if 'lm_head' in name:
-                param.requires_grad = True
-                adapt_params.append(param)
-            elif 'norm' in name:
-                param.requires_grad = True
-                adapt_params.append(param)
-            # elif 'fc' in name:
-            #     param.requires_grad = True
-            #     adapt_params.append(param)
-            else:
-                param.requires_grad = False
+            param.requires_grad = True
+
+        # adapt_params = []
+        # for name, param in self.ea_layer.named_parameters():
+        #     if 'lm_head' in name:
+        #         param.requires_grad = True
+        #         adapt_params.append(param)
+        #     elif 'norm' in name:
+        #         param.requires_grad = True
+        #         adapt_params.append(param)
+        #     elif 'fc' in name:
+        #         param.requires_grad = True
+        #         adapt_params.append(param)
+        #     else:
+        #         param.requires_grad = False
                 
-        self.adapter_optimizer = torch.optim.Adam(adapt_params, lr=adaptation_lr)
+        self.adapter_optimizer = torch.optim.Adam(self.ea_layer.parameters(), lr=adaptation_lr)
 
     def _perform_online_adaptation(
             self, 
@@ -159,6 +156,7 @@ class EaModel(nn.Module):
                 t2d_cpu = self.ea_layer.t2d
             
             valid_token_mask = (accepted_tokens_cpu >= 0) & (accepted_tokens_cpu < t2d_cpu.shape[0])
+
             if not valid_token_mask.any():
                 self.ea_layer.eval()
                 print("error11111")
@@ -224,31 +222,21 @@ class EaModel(nn.Module):
                 dtype=target_logits_filtered.dtype
             )
 
-            # d2t_cpu = self.ea_layer.d2t.cpu() if self.ea_layer.d2t.is_cuda else self.ea_layer.d2t
-            
-            # for draft_idx in range(self.draft_vocab_size):
-            #     target_idx = d2t_cpu[draft_idx].item()
-            #     if 0 <= target_idx < self.vocab_size:
-            #         if target_idx < target_logits_filtered.shape[-1]:
-            #             mapped_target_logits[:, :, draft_idx] = target_logits_filtered[:, :, target_idx]
-            
             d2t = self.ea_layer.d2t
             if d2t.device != device:
                 d2t = d2t.to(device)
-
-            real_vocab_limit = target_logits_filtered.shape[-1]
-            valid_map_mask = (d2t >= 0) & (d2t < real_vocab_limit)
-            valid_draft_indices = torch.where(valid_map_mask)[0] 
-            valid_target_indices = d2t[valid_draft_indices]    
             
-            if len(valid_draft_indices) > 0:
-                selected_values = target_logits_filtered[..., valid_target_indices]
-                mapped_target_logits[..., valid_draft_indices] = selected_values
-
+            for draft_idx in range(self.draft_vocab_size):
+                target_idx = d2t[draft_idx].item()
+                if 0 <= target_idx < self.vocab_size:
+                    if target_idx < target_logits_filtered.shape[-1]:
+                        mapped_target_logits[:, :, draft_idx] = target_logits_filtered[:, :, target_idx]
+            
             # if target_logits.dim() == 2:
             #     mapped_target_logits = mapped_target_logits.squeeze(0)
         else:
             indices_to_use = accepted_indices[:-1]
+
             if len(indices_to_use) == 0:
                 self.ea_layer.eval()
                 print("error66666")
@@ -293,59 +281,60 @@ class EaModel(nn.Module):
         total_loss = 0.0
         temp = max(self.adaptation_temperature, 1e-5)
         
-        for _ in range(self.adaptation_steps):
-            self.adapter_optimizer.zero_grad()
-            
-            # forward draft model
-            if hasattr(self.ea_layer, 'fc'):
-                draft_hidden = self.ea_layer.fc(input_hidden)
-            else:
-                draft_hidden = input_hidden.clone()
-
-            # get predictions of draft model for tokens
-            draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden))
-
-            draft_logits_batch = draft_logits
-            target_logits_batch = mapped_target_logits
-            
-            if draft_logits_batch.dim() == 3 and draft_logits_batch.shape[0] == 1:
-                draft_logits_batch = draft_logits_batch.squeeze(0)
-            
-            if draft_logits_batch.shape[:-1] != target_logits_batch.shape[:-1]:
-                if draft_logits_batch.dim() == 2 and target_logits_batch.dim() == 2:
-                    min_len = min(draft_logits_batch.shape[0], target_logits_batch.shape[0])
-                    draft_logits_batch = draft_logits_batch[:min_len]
-                    target_logits_batch = target_logits_batch[:min_len]
-                else:
-                    self.ea_layer.eval()
-                    return 0.0
+        self.adapter_optimizer.zero_grad()
         
-            if draft_logits_batch.shape[-1] > self.draft_vocab_size:
-                draft_logits_batch = draft_logits_batch[..., :self.draft_vocab_size]
-            
-            log_probs = F.log_softmax(draft_logits_batch / temp, dim=-1)
-            target_probs = F.softmax(target_logits_batch / temp, dim=-1)
-            
-            epsilon = 1e-10
-            target_probs = target_probs + epsilon
-            target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
-            
-            loss = (target_probs * (target_probs.log() - log_probs)).sum(dim=-1).mean()
-            
-            if torch.isnan(loss) or torch.isinf(loss):
+        # forward draft model
+        if hasattr(self.ea_layer, 'fc'):
+            draft_hidden = self.ea_layer.fc(input_hidden)
+        else:
+            draft_hidden = input_hidden.clone()
+
+        # get predictions of draft model for tokens
+        draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden))
+
+        draft_logits_batch = draft_logits
+        target_logits_batch = mapped_target_logits
+        
+        if draft_logits_batch.dim() == 3 and draft_logits_batch.shape[0] == 1:
+            draft_logits_batch = draft_logits_batch.squeeze(0)
+        
+        if draft_logits_batch.shape[:-1] != target_logits_batch.shape[:-1]:
+            if draft_logits_batch.dim() == 2 and target_logits_batch.dim() == 2:
+                min_len = min(draft_logits_batch.shape[0], target_logits_batch.shape[0])
+                draft_logits_batch = draft_logits_batch[:min_len]
+                target_logits_batch = target_logits_batch[:min_len]
+            else:
                 self.ea_layer.eval()
+                print("error88888")
                 return 0.0
-                
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.adapter_optimizer.param_groups[0]['params'], 
-                max_norm=1.0
-            )
-            self.adapter_optimizer.step()
-            total_loss += loss.item()
+    
+        if draft_logits_batch.shape[-1] > self.draft_vocab_size:
+            draft_logits_batch = draft_logits_batch[..., :self.draft_vocab_size]
+        
+        log_probs = F.log_softmax(draft_logits_batch / temp, dim=-1)
+        target_probs = F.softmax(target_logits_batch / temp, dim=-1)
+        
+        epsilon = 1e-10
+        target_probs = target_probs + epsilon
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+            
+        loss = (target_probs * (target_probs.log() - log_probs)).sum(dim=-1).mean()
+        
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.ea_layer.eval()
+            print("error99999")
+            return 0.0
+            
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.adapter_optimizer.param_groups[0]['params'], 
+            max_norm=1.0
+        )
+        self.adapter_optimizer.step()
+        total_loss += loss.item()
         
         self.ea_layer.eval()  # to eval mode
-        return total_loss / self.adaptation_steps
+        return total_loss
 
     @classmethod
     def from_pretrained(
@@ -469,12 +458,10 @@ class EaModel(nn.Module):
             is_llama3=False,
             enable_adaptation=None,
             adaptation_lr=None,
-            adaptation_steps=None,
             adaptation_temperature=None,
     ):
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
 
         if temperature > 1e-5:
             logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
@@ -484,9 +471,8 @@ class EaModel(nn.Module):
         if enable_adaptation is not None and enable_adaptation:
             if self.adapter_optimizer is None:
                 self.setup_online_adaptation(
-                    adaptation_lr=adaptation_lr or 0.001,
-                    adaptation_steps=adaptation_steps or 1,
-                    adaptation_temperature=adaptation_temperature or 1.0
+                    adaptation_lr=adaptation_lr or 5e-5,
+                    adaptation_temperature=adaptation_temperature or 2.0
                 )
 
         use_adaptation = enable_adaptation if enable_adaptation is not None else self.enable_online_adaptation # online params
