@@ -8,7 +8,7 @@ import json
 import os
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 from accelerate.utils import set_seed
 set_seed(0)
 
@@ -114,10 +114,9 @@ def get_model_answers(
     if args.enable_online_adaptation:
         model.setup_online_adaptation(
             adaptation_lr=args.adaptation_lr,
-            adaptation_steps=args.adaptation_steps,
             adaptation_temperature=args.adaptation_temperature
         )
-        print(f"Online adaptation enabled with lr={args.adaptation_lr}, steps={args.adaptation_steps}")
+        print(f"Online adaptation enabled with lr={args.adaptation_lr}")
 
     tokenizer = model.get_tokenizer()
 
@@ -170,7 +169,6 @@ def get_model_answers(
                 is_llama3=True,
                 enable_adaptation=args.enable_online_adaptation,  # online
                 adaptation_lr=args.adaptation_lr,
-                adaptation_steps=args.adaptation_steps,
                 adaptation_temperature=args.adaptation_temperature
             )
             torch.cuda.synchronize()
@@ -256,7 +254,6 @@ def get_model_answers(
                     is_llama3=True,
                     enable_adaptation=args.enable_online_adaptation,  # online
                     adaptation_lr=args.adaptation_lr,
-                    adaptation_steps=args.adaptation_steps,
                     adaptation_temperature=args.adaptation_temperature
                 )
                 torch.cuda.synchronize()
@@ -421,9 +418,8 @@ if __name__ == "__main__":
         action="store_true"
     )
     parser.add_argument("--enable-online-adaptation", action="store_true")
-    parser.add_argument("--adaptation-lr", type=float, default=0.001)
-    parser.add_argument("--adaptation-steps", type=int, default=1)
-    parser.add_argument("--adaptation-temperature", type=float, default=1.0)
+    parser.add_argument("--adaptation-lr", type=float, default=5e-5)
+    parser.add_argument("--adaptation-temperature", type=float, default=2.0)
 
     args = parser.parse_args()
 
