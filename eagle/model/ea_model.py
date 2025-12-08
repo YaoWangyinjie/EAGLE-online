@@ -230,17 +230,36 @@ class EaModel(nn.Module):
             self.ea_layer.train(was_training)
             print("error0555555")
             return 0.0
-        
-        # Forward
+
+        # forward
         with torch.enable_grad():
-            draft_hidden_out = self.ea_layer(
-                hidden_states=input_hidden,      # [1, num_valid, hidden_size*3]
-                input_ids=input_tokens_batch,    # [1, num_valid]
-                use_cache=False
+            inputs_embeds = self.ea_layer.embed_tokens(input_tokens_batch)
+            inputs_embeds = inputs_embeds.to(input_hidden.dtype)
+            
+            draft_hidden = self.ea_layer.fc(input_hidden)  # [1, num_valid, hidden_size]
+            batch_size = 1
+            seq_length = num_valid
+            
+            causal_mask = torch.triu(
+                torch.full((seq_length, seq_length), float('-inf'), device=device, dtype=draft_hidden.dtype),
+                diagonal=1
             )
-            # draft_hidden_out: [1, num_valid, hidden_size]
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+            position_ids = torch.arange(num_valid, device=device, dtype=torch.long).unsqueeze(0) # 可能有问题
+            
+            layer_outputs = self.ea_layer.midlayer(
+                input_emb=inputs_embeds,
+                hidden_states=draft_hidden,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+            )
+            
+            draft_hidden_out = layer_outputs[0]  # [1, num_valid, hidden_size]
             draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden_out))
-            draft_logits = draft_logits.squeeze(0)  # [num_valid, draft_vocab_size]
+            draft_logits = draft_logits.squeeze(0)  # [num_valid, vocab_size]
         
         if draft_logits.shape[-1] != target_logits.shape[-1]:
             min_vocab = min(draft_logits.shape[-1], target_logits.shape[-1])
