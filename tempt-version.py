@@ -131,210 +131,164 @@ class EaModel(nn.Module):
         self.adapter_optimizer = torch.optim.Adam(self.ea_layer.parameters(), lr=adaptation_lr)
 
     def _perform_online_adaptation(
-            self, 
+            self,
             input_ids,
-            candidates,
-            retrieve_indices,
-            best_candidate,
+            candidates, # candidates[c, i]为第c条候选路径在第i步的token id
+            retrieve_indices, # retrieve_indices[c, i]为第c条候选路径在第i步的tree index
+            best_candidate, 
             accept_length,
-            hidden_state_new,
-            logits
-    ):
-        """one-step online adaptation"""
-        self.ea_layer.train()  # to train mode
-        device = hidden_state_new.device
-
-        accepted_indices = retrieve_indices[best_candidate, :accept_length+1]
-        accepted_tokens = candidates[best_candidate, :accept_length+1]
-        target_logits = logits[best_candidate, :accept_length]
-
+            hidden_state_new, # [0,i,:]为base model处理第i个tree token后的hidden state [1，nodes, hidden_dim*3]
+            logits, # 按候选路径重排的logits，[candidate_sum, depth+1, vocab_size]
+            prompt_hidden_states, # 前文的hidden states
+            train_steps
+        ):
+        device = next(self.ea_layer.parameters()).device
+        was_training = self.ea_layer.training
+        self.ea_layer.train()
+    
+        accepted_indices = retrieve_indices[best_candidate, :accept_length + 1] # best candidate被选中的候选路径
+        accepted_tokens = candidates[best_candidate, :accept_length + 1] # 被选中的原始token id
+        target_logits = logits[best_candidate, :accept_length] # best candidate路径中的预测logits
+        
+        if accepted_indices.device != device:
+            accepted_indices = accepted_indices.to(device)
+        if accepted_tokens.device != device:
+            accepted_tokens = accepted_tokens.to(device)
+        if target_logits.device != device:
+            target_logits = target_logits.to(device)
+        if hidden_state_new.device != device:
+            hidden_state_new = hidden_state_new.to(device)
+        if input_ids.device != device:
+            input_ids = input_ids.to(device)
+        if prompt_hidden_states.device != device:
+            prompt_hidden_states = prompt_hidden_states.to(device)
+        
+        input_indices = accepted_indices[:-1]  # 去除最后一个token的tree index
+        input_tokens = accepted_tokens[:-1]    # 去除最后一个token的原始token id
+        num_tokens = len(input_indices)
+        
+        max_idx = hidden_state_new.shape[1] - 1
+        valid_mask = (input_indices >= 0) & (input_indices <= max_idx)
+        
+        valid_positions = torch.where(valid_mask)[0]
+        input_indices = input_indices[valid_mask]
+        input_tokens = input_tokens[valid_mask]
+        num_valid = len(input_indices)
+        
+        input_hidden = hidden_state_new[:, input_indices, :].detach() # 提取hidden states
+        target_logits = target_logits[valid_positions].detach()
+        
         if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
-            accepted_tokens_cpu = accepted_tokens[:-1].cpu()
-            if self.ea_layer.t2d.is_cuda:
-                t2d_cpu = self.ea_layer.t2d.cpu()
-            else:
-                t2d_cpu = self.ea_layer.t2d
-            
-            valid_token_mask = (accepted_tokens_cpu >= 0) & (accepted_tokens_cpu < t2d_cpu.shape[0])
-
-            if not valid_token_mask.any():
-                self.ea_layer.eval()
-                print("error11111")
-                return 0.0
-            
-            accepted_tokens_filtered = accepted_tokens_cpu[valid_token_mask]
-            
-            draft_indices = t2d_cpu[accepted_tokens_filtered]
-            valid_draft_mask = (draft_indices >= 0) & (draft_indices < self.draft_vocab_size)
-            
-            if not valid_draft_mask.any():
-                self.ea_layer.eval()
-                print("error22222")
-                return 0.0
-
-            valid_token_indices = torch.where(valid_token_mask)[0]  
-            final_valid_indices = valid_token_indices[valid_draft_mask]  
-
-            safe_mask = final_valid_indices < target_logits.shape[0]
-            final_valid_indices = final_valid_indices[safe_mask]
-            
-            if len(final_valid_indices) == 0:
-                self.ea_layer.eval()
-                print("error33333")
-                return 0.0
-
-            if accepted_indices.device != device:
-                accepted_indices = accepted_indices.to(device)
-        
-            valid_accepted_indices = accepted_indices[:-1][final_valid_indices.to(device)]
-            
-            if len(valid_accepted_indices) == 0:
-                self.ea_layer.eval()
-                print("error44444")
-                return 0.0
-
-            max_idx = hidden_state_new.shape[1] - 1
-            valid_hidden_mask = valid_accepted_indices <= max_idx
-            valid_accepted_indices = valid_accepted_indices[valid_hidden_mask]
-            final_valid_indices = final_valid_indices[valid_hidden_mask.cpu()]
-            
-            if len(valid_accepted_indices) == 0:
-                self.ea_layer.eval()
-                print("error55555")
-                return 0.0
-            
-            input_hidden = hidden_state_new[:, valid_accepted_indices].detach()
-            target_logits_filtered = target_logits[final_valid_indices]
-
-            if target_logits_filtered.dim() == 2:
-                target_logits_filtered = target_logits_filtered.unsqueeze(0)
-            
-            batch_size = target_logits_filtered.shape[0]
-            seq_len = target_logits_filtered.shape[1] if target_logits_filtered.dim() > 2 else 1
-        
-            if target_logits_filtered.dim() == 2:
-                target_logits_filtered = target_logits_filtered.unsqueeze(0)
-            
-            mapped_target_logits = torch.full(
-                (batch_size, seq_len, self.draft_vocab_size), 
-                float('-inf'), 
-                device=device,
-                dtype=target_logits_filtered.dtype
-            )
-
             d2t = self.ea_layer.d2t
             if d2t.device != device:
                 d2t = d2t.to(device)
             
-            for draft_idx in range(self.draft_vocab_size):
-                target_idx = d2t[draft_idx].item()
-                if 0 <= target_idx < self.vocab_size:
-                    if target_idx < target_logits_filtered.shape[-1]:
-                        mapped_target_logits[:, :, draft_idx] = target_logits_filtered[:, :, target_idx]
+            # 创建映射后的target logits [num_valid, draft_vocab_size]
+            mapped_target_logits = torch.full(
+                (num_valid, self.draft_vocab_size),
+                torch.finfo(target_logits.dtype).min / 2,
+                device=device,
+                dtype=target_logits.dtype
+            )
             
-            # if target_logits.dim() == 2:
-            #     mapped_target_logits = mapped_target_logits.squeeze(0)
+            # d2t[draft_idx] = target_idx，复制对应的logit值
+            valid_draft_indices = torch.arange(self.draft_vocab_size, device=device)
+            target_indices = d2t[valid_draft_indices]
+            valid_mapping = (target_indices >= 0) & (target_indices < target_logits.shape[-1])
+            
+            # 遍历draft vocab，找到它在target vocab中的映射，把target logits复制到mapped_target_logits中
+            for i in range(num_valid):
+                mapped_target_logits[i, valid_mapping] = target_logits[i, target_indices[valid_mapping]]
+            
+            target_logits = mapped_target_logits
         else:
-            indices_to_use = accepted_indices[:-1]
+            if target_logits.shape[-1] > self.draft_vocab_size:
+                target_logits = target_logits[..., :self.draft_vocab_size]
+        
+        context_len = input_ids.shape[1] # 前文prompt的长度
+        cat_tokens = torch.cat([input_ids[0],input_tokens], dim=0) # [context_len + num_valid]
+        input_tokens_batch = cat_tokens.unsqueeze(0)  # [1, context_len+num_valid]
+        cat_len = context_len + num_valid
 
-            if len(indices_to_use) == 0:
-                self.ea_layer.eval()
-                print("error66666")
-                return 0.0
-                
-            max_idx = hidden_state_new.shape[1] - 1
-            indices_to_use = indices_to_use[indices_to_use <= max_idx]
-            
-            if len(indices_to_use) == 0:
-                self.ea_layer.eval()
-                print("error77777")
-                return 0.0
-            
-            input_hidden = hidden_state_new[:, indices_to_use].detach()
+        hidden_dim = input_hidden.shape[-1]
+        expected_dim = self.ea_layer.fc.in_features
+        
+        prompt_len = prompt_hidden_states.shape[1]
+        context_hidden = prompt_hidden_states.detach() # 前文prompt的hidden states
+        
+        full_hidden = torch.cat([context_hidden, input_hidden], dim=1)
 
-            if target_logits.dim() == 2:
-                target_logits_3d = target_logits.unsqueeze(0)
-            else:
-                target_logits_3d = target_logits
-
-            if target_logits_3d.shape[-1] > self.draft_vocab_size:
-                mapped_target_logits = target_logits_3d[..., :self.draft_vocab_size]
-            else:
-                mapped_target_logits = target_logits_3d
-
-        mapped_target_logits = mapped_target_logits.detach()
-        
-        if input_hidden.dim() == 3 and input_hidden.shape[0] == 1:
-            input_hidden = input_hidden.squeeze(0)
-        
-        if mapped_target_logits.dim() == 3 and mapped_target_logits.shape[0] == 1:
-            mapped_target_logits = mapped_target_logits.squeeze(0)
-        
-        if input_hidden.dim() == 2 and mapped_target_logits.dim() == 2:
-            min_len = min(input_hidden.shape[0], mapped_target_logits.shape[0])
-            input_hidden = input_hidden[:min_len]
-            mapped_target_logits = mapped_target_logits[:min_len]
-        
-        if mapped_target_logits.shape[-1] > self.draft_vocab_size:
-            mapped_target_logits = mapped_target_logits[..., :self.draft_vocab_size]
-        
         total_loss = 0.0
-        temp = max(self.adaptation_temperature, 1e-5)
-        
-        self.adapter_optimizer.zero_grad()
-        
-        # forward draft model
-        if hasattr(self.ea_layer, 'fc'):
-            draft_hidden = self.ea_layer.fc(input_hidden)
-        else:
-            draft_hidden = input_hidden.clone()
+        for step in range(train_steps):
+            self.adapter_optimizer.zero_grad()
 
-        # get predictions of draft model for tokens
-        draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden))
+            # Forward
+            with torch.enable_grad():
+                inputs_embeds = self.ea_layer.embed_tokens(input_tokens_batch)
+                inputs_embeds = inputs_embeds.to(full_hidden.dtype) # [1, context_len+num_valid, embedded_dim]
+                
+                draft_hidden = self.ea_layer.fc(full_hidden)  # [1, context_len+num_valid, hidden_size]
+                batch_size = 1
+                seq_length = cat_len
+                
+                causal_mask = torch.triu(
+                    torch.full((seq_length, seq_length), float('-inf'), device=device, dtype=draft_hidden.dtype),
+                    diagonal=1
+                )
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+                position_ids = torch.arange(seq_length, device=device, dtype=torch.long).unsqueeze(0) # 可能有问题，现在用的相对位置
+                
+                layer_outputs = self.ea_layer.midlayer(
+                    input_emb=inputs_embeds,
+                    hidden_states=draft_hidden,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+                
+                draft_hidden_out = layer_outputs[0]  # [1, seq_length, hidden_size]
+                draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden_out))
+                draft_logits = draft_logits.squeeze(0)  # [seq_length, vocab_size]
 
-        draft_logits_batch = draft_logits
-        target_logits_batch = mapped_target_logits
-        
-        if draft_logits_batch.dim() == 3 and draft_logits_batch.shape[0] == 1:
-            draft_logits_batch = draft_logits_batch.squeeze(0)
-        
-        if draft_logits_batch.shape[:-1] != target_logits_batch.shape[:-1]:
-            if draft_logits_batch.dim() == 2 and target_logits_batch.dim() == 2:
-                min_len = min(draft_logits_batch.shape[0], target_logits_batch.shape[0])
-                draft_logits_batch = draft_logits_batch[:min_len]
-                target_logits_batch = target_logits_batch[:min_len]
-            else:
-                self.ea_layer.eval()
-                print("error88888")
-                return 0.0
-    
-        if draft_logits_batch.shape[-1] > self.draft_vocab_size:
-            draft_logits_batch = draft_logits_batch[..., :self.draft_vocab_size]
-        
-        log_probs = F.log_softmax(draft_logits_batch / temp, dim=-1)
-        target_probs = F.softmax(target_logits_batch / temp, dim=-1)
-        
-        epsilon = 1e-10
-        target_probs = target_probs + epsilon
-        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+                draft_logits = draft_logits[-num_valid:, :] # 只取num_valid个，前文不参与loss计算
             
-        loss = (target_probs * (target_probs.log() - log_probs)).sum(dim=-1).mean()
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            self.ea_layer.eval()
-            print("error99999")
-            return 0.0
+            if draft_logits.shape[-1] != target_logits.shape[-1]:
+                min_vocab = min(draft_logits.shape[-1], target_logits.shape[-1])
+                draft_logits = draft_logits[..., :min_vocab]
+                target_logits = target_logits[..., :min_vocab]
             
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.adapter_optimizer.param_groups[0]['params'], 
-            max_norm=1.0
-        )
-        self.adapter_optimizer.step()
-        total_loss += loss.item()
+            min_len = min(draft_logits.shape[0], target_logits.shape[0])
+            
+            draft_logits = draft_logits[:min_len]
+            target_logits = target_logits[:min_len]
+            temp = self.adaptation_temperature
+            
+            log_p = F.log_softmax(draft_logits / temp, dim=-1)
+            q = F.softmax(target_logits / temp, dim=-1)
+            
+            kl_per_element = F.kl_div(log_p, q, reduction='none')  # [num_valid, vocab_size]
+            kl_per_token = kl_per_element.sum(dim=-1)  # [num_valid]
+            loss = kl_per_token.mean() * (temp ** 2)
+            
+            # if torch.isnan(loss) or torch.isinf(loss):
+            #     print(f"[Adaptation] Invalid loss: {loss.item()}")
+            #     self.ea_layer.train(was_training)
+            #     print("error0777777")
+            #     return 0.0            
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.ea_layer.parameters() if p.requires_grad],
+                max_norm=1.0
+            )
+            
+            self.adapter_optimizer.step()
+            total_loss += loss.item()
         
-        self.ea_layer.eval()  # to eval mode
-        return total_loss
+        self.ea_layer.train(was_training)
+        return total_loss / train_steps
 
     @classmethod
     def from_pretrained(
@@ -515,6 +469,8 @@ class EaModel(nn.Module):
                 input_ids, self, past_key_values, logits_processor
             )
 
+        prompt_hidden_states = hidden_state if use_adaptation else None
+
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
@@ -549,7 +505,9 @@ class EaModel(nn.Module):
                         best_candidate=best_candidate,
                         accept_length=accept_length,
                         hidden_state_new=hidden_state_new,
-                        logits=logits
+                        logits=logits,
+                        prompt_hidden_states=prompt_hidden_states,
+                        train_steps=10
                     )
                     
                     adaptation_info['losses'].append(adapt_loss)
