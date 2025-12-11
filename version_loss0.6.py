@@ -161,6 +161,7 @@ class EaModel(nn.Module):
         was_training = self.ea_layer.training
 
         saved_tree_mask = getattr(self.ea_layer, 'tree_mask', None)
+        saved_stable_kv = self.ea_layer.stable_kv
 
 
         self.ea_layer.train()
@@ -253,6 +254,7 @@ class EaModel(nn.Module):
             for step in range(train_steps):
                 self.adapter_optimizer.zero_grad()
                 self.ea_layer.reset()
+                self.ea_layer.stable_kv = None
 
                 # target_outputs = self.base_model(input_tokens_batch)
                 layer_outputs = self.ea_layer(
@@ -378,6 +380,7 @@ class EaModel(nn.Module):
                 total_loss += loss.item()
         
         self.ea_layer.tree_mask = saved_tree_mask
+        self.ea_layer.stable_kv = saved_stable_kv
         self.ea_layer.to(original_dtype)
         self.ea_layer.train(was_training)
 
