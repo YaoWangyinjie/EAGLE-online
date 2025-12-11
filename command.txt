@@ -24,9 +24,10 @@ gen_ea_answer_llama3chat.py中可用gpu数量
 配置debug，注意添加python的路径为which python
 配置环境按requirements安装后调整torch==2.6.0,torchvision==0.21.0,torchaudio==2.6.0
 
-处理任务：
-learning rate, temperature
-持续累积的adapter与question权重
-使用tokenizer处理bug
-
-解决问题：reset，词表对齐，数据类型转换，prompt引入后使用的hidden state
+解决问题：
+reset：是否需要使用，保存状态并恢复是否正常
+词表对齐：可能有问题
+数据类型转换：训练结束时是否复原数据类型状态
+prompt引入后使用的hidden state：前文使用具体哪一个hidden state，训练时具体调用哪个hidden state
+持续状态：累积的权重和cache产生污染，需要合理清空
+超参：lr，temperature
