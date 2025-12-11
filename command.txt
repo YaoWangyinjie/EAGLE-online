@@ -29,5 +29,5 @@ reset：是否需要使用，保存状态并恢复是否正常
 词表对齐：可能有问题
 数据类型转换：训练结束时是否复原数据类型状态
 prompt引入后使用的hidden state：前文使用具体哪一个hidden state，训练时具体调用哪个hidden state
-持续状态：累积的权重和cache产生污染，需要合理清空
+持续状态：累积的权重和cache产生污染，同时考虑前文的seq_len也因此产生不匹配，需要合理清空
 超参：lr，temperature
