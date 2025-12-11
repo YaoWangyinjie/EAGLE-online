@@ -419,7 +419,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable-online-adaptation", action="store_true")
     parser.add_argument("--adaptation-lr", type=float, default=5e-5)
-    parser.add_argument("--adaptation-temperature", type=float, default=2.0)
+    parser.add_argument("--adaptation-temperature", type=float, default=1.0)
 
     args = parser.parse_args()
 
