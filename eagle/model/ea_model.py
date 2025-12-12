@@ -147,37 +147,24 @@ class EaModel(nn.Module):
         ):
         device = next(self.ea_layer.parameters()).device
 
+        # 这里转换数据格式，从bf16到float32以解决训练中爆表的问题，输入也进行转换
         original_dtype = next(self.ea_layer.parameters()).dtype
         self.ea_layer.float()
 
-        # 确保输入也是 float32
         if hidden_state_new.dtype != torch.float32:
             hidden_state_new = hidden_state_new.float()
         if prompt_hidden_states.dtype != torch.float32:
             prompt_hidden_states = prompt_hidden_states.float()
 
-        print(f"\n{'='*60}")
-        print(f"[DEBUG] _perform_online_adaptation 开始")
-        print(f"{'='*60}")
-        print(f"input_ids shape: {input_ids.shape}")
-        print(f"prompt_hidden_states shape: {prompt_hidden_states.shape}")
-        print(f"hidden_state_new shape: {hidden_state_new.shape}")
-        
-        # 检查长度是否匹配
-        if prompt_hidden_states.shape[1] != input_ids.shape[1]:
-            print(f"[WARNING] prompt_hidden_states 长度 ({prompt_hidden_states.shape[1]}) "
-                f"!= input_ids 长度 ({input_ids.shape[1]})")
-            print(f"这说明 prompt_hidden_states 没有被正确更新！")
-
-
         was_training = self.ea_layer.training
 
+        # 这里保存tree_mask和kv_cache以供后续恢复，训练时禁用以防kv_cache被污染以及tree_mask影响训练
         saved_tree_mask = getattr(self.ea_layer, 'tree_mask', None)
         saved_stable_kv = self.ea_layer.stable_kv
         self.ea_layer.reset()
         self.ea_layer.stable_kv = None
 
-
+        # 训练模式
         self.ea_layer.train()
     
         accepted_indices = retrieve_indices[best_candidate, :accept_length + 1] # best candidate被选中的候选路径
@@ -324,9 +311,6 @@ class EaModel(nn.Module):
                     print(f"Draft top-1 概率: {draft_probs.max(dim=-1).values.tolist()}")
                     print(f"Target top-1 概率: {target_probs.max(dim=-1).values.tolist()}")
                 # ========== 调试结束 ==========
-
-
-
                 
                 if draft_logits.shape[-1] != target_logits.shape[-1]:
                     min_vocab = min(draft_logits.shape[-1], target_logits.shape[-1])
@@ -370,22 +354,16 @@ class EaModel(nn.Module):
                 print(f"总梯度范数: {total_grad_norm:.6f}")
                 # ========== 梯度检查结束 ==========
 
-
-
-
-                
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.ea_layer.parameters() if p.requires_grad],
                     max_norm=1.0
                 )
-
 
                 # ========== 权重更新前后检查 ==========
                 # 记录更新前的 lm_head 权重
                 lm_head_before = self.ea_layer.lm_head.weight.data.clone()
                 
                 self.adapter_optimizer.step()
-
 
                 # 检查权重变化
                 lm_head_after = self.ea_layer.lm_head.weight.data
@@ -395,13 +373,11 @@ class EaModel(nn.Module):
 
                 total_loss += loss.item()
         
-
         # 这里恢复了tree_mask,kv_cache,数据类型
         self.ea_layer.tree_mask = saved_tree_mask
         self.ea_layer.stable_kv = saved_stable_kv
         self.ea_layer.to(original_dtype)
         self.ea_layer.train(was_training)
-
 
         # 在 _perform_online_adaptation 结束前，检查 ea_layer 的状态
         print(f"\n{'='*50}")
