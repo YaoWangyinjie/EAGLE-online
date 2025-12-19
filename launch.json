@@ -1,0 +1,38 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Debug EAGLE Online",
+            "type": "python",
+            "request": "launch",
+            "module": "EAGLE-online.eagle.evaluation.gen_ea_answer_llama3chat",
+            "python":"${workspaceFolder}/eagle/bin/python", # 这里要改成正确的python路径，使用eagle是因为该背景下开启了名为eagle的虚拟环境
+            "args": [
+                "--ea-model-path",
+                "model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/",
+                "--base-model-path",
+                "model_weight/DeepSeek-R1-Distill-Llama-8B/",
+                "--use_eagle3",
+                "--enable-online-adaptation",
+                "--model-id",
+                "0"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {},
+            "stopOnEntry": false
+        }
+    ]
+}
