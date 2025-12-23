@@ -133,36 +133,6 @@ class EaModel(nn.Module):
                 
         self.adapter_optimizer = torch.optim.Adam(self.ea_layer.parameters(), lr=adaptation_lr)
 
-    def setup_online_adaptation(
-            self, 
-            adaptation_lr=const_lr, 
-            adaptation_temperature=const_temp
-        ):
-        """superparams of online adaptation"""
-        self.enable_online_adaptation = True
-        self.adaptation_lr = adaptation_lr
-        self.adaptation_temperature = adaptation_temperature
-        self.first_token_adapted = False
-        
-        for param in self.ea_layer.parameters():
-            param.requires_grad = True
-
-        # adapt_params = []
-        # for name, param in self.ea_layer.named_parameters():
-        #     if 'lm_head' in name:
-        #         param.requires_grad = True
-        #         adapt_params.append(param)
-        #     elif 'norm' in name:
-        #         param.requires_grad = True
-        #         adapt_params.append(param)
-        #     elif 'fc' in name:
-        #         param.requires_grad = True
-        #         adapt_params.append(param)
-        #     else:
-        #         param.requires_grad = False
-                
-        self.adapter_optimizer = torch.optim.Adam(self.ea_layer.parameters(), lr=adaptation_lr)
-
     def _perform_online_adaptation(
             self,
             input_ids,
