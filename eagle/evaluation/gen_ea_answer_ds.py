@@ -8,7 +8,7 @@ import json
 import os
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
-#os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 from accelerate.utils import set_seed
 set_seed(0)
 
@@ -82,11 +82,24 @@ def run_eval(
             )
         )
 
+    # if use_ray:
+    #     ray.get(ans_handles)
+
+    all_stats_collected = []
+    
     if use_ray:
-        ray.get(ans_handles)
+        results = ray.get(ans_handles) # 获取所有进程返回的 list
+        for stats_list in results:
+            all_stats_collected.extend(stats_list)
+    else:
+        # 单卡模式下 ans_handles 已经是 list of list
+        for stats_list in ans_handles:
+            all_stats_collected.extend(stats_list)
 
+    # 构造统计文件名：{model_id}_stat.txt
+    stat_file = f"{os.path.dirname(answer_file)}/{args.model_id}_stat.txt"
+    save_statistics(all_stats_collected, stat_file)
 
-@torch.inference_mode()
 def get_model_answers(
         base_model_path,
         ea_model_path,
@@ -113,6 +126,13 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto"
     )
+
+    if args.enable_online_adaptation:
+        model.setup_online_adaptation(
+            adaptation_lr=args.adaptation_lr,
+            adaptation_temperature=args.adaptation_temperature
+        )
+        print(f"Online adaptation enabled with lr={args.adaptation_lr}")
 
     tokenizer = model.get_tokenizer()
 
@@ -155,11 +175,14 @@ def get_model_answers(
             torch.cuda.synchronize()
             start_time = time.time()
 
-            output_ids, new_token, idx = model.eagenerate(
+            output_ids, new_token, idx, warmup_stats = model.eagenerate(
                 torch.as_tensor(input_ids).cuda(),
                 temperature=temperature,
                 log=True,
                 is_llama3=True,
+                enable_adaptation=args.enable_online_adaptation,  # online
+                adaptation_lr=args.adaptation_lr,
+                adaptation_temperature=args.adaptation_temperature
             )
             torch.cuda.synchronize()
             total_time = time.time() - start_time
@@ -206,6 +229,8 @@ def get_model_answers(
             })
     print('Warmup done')
 
+    local_stats = [] 
+
     # questions=questions[6:]
     for question in tqdm(questions):
 
@@ -234,14 +259,52 @@ def get_model_answers(
                 torch.cuda.synchronize()
                 start_time = time.time()
 
-                output_ids, new_token, idx = model.eagenerate(
+                output_ids, new_token, idx, run_stats = model.eagenerate(
                     torch.as_tensor(input_ids).cuda(),
                     temperature=temperature,
                     log=True,
                     is_llama3=True,
+                    enable_adaptation=args.enable_online_adaptation,  # online
+                    adaptation_lr=args.adaptation_lr,
+                    adaptation_temperature=args.adaptation_temperature
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
+
+                r_accept_len = run_stats['total_accept_length']
+                if hasattr(r_accept_len, 'item'):
+                    r_accept_len = r_accept_len.item()
+                    
+                r_drafted = run_stats['total_drafted_tokens']
+                if hasattr(r_drafted, 'item'):
+                    r_drafted = r_drafted.item()
+                    
+                r_steps = run_stats['total_steps']
+                if hasattr(r_steps, 'item'):
+                    r_steps = r_steps.item()
+
+                avg_accept = r_accept_len / r_steps if r_steps > 0 else 0
+                if r_drafted > 0:
+                    acc_rate = r_accept_len / r_drafted
+                else:
+                    acc_rate = 0.0
+
+                losses = run_stats['losses']
+                avg_loss = sum(losses) / len(losses) if len(losses) > 0 else None
+                
+                speed = int(new_token) / total_time if total_time > 0 else 0
+
+                local_stats.append({
+                    "qid": question["question_id"],
+                    "speed": speed,
+                    "acc_rate": acc_rate,          # 这里的 acc_rate 已经是 float 了
+                    "avg_accept_len": avg_accept,  # float
+                    "total_accept_tokens": r_accept_len, # int/float
+                    "avg_loss": avg_loss,
+                    "new_tokens": int(new_token),
+                    "time": total_time
+                })
+
                 output_ids = output_ids[0][len(input_ids[0]):]
                 # be consistent with the template's stop_token_ids
                 stop_token_ids = [
@@ -309,6 +372,69 @@ def reorg_answer_file(answer_file):
     with open(answer_file, "w") as fout:
         for qid in qids:
             fout.write(answers[qid])
+
+def save_statistics(all_stats, stat_file):
+    """统计并保存详细性能数据"""
+    if not all_stats:
+        return
+
+    # 提取各列数据
+    speeds = [s['speed'] for s in all_stats]
+    acc_rates = [s['acc_rate'] for s in all_stats] # 接受率
+    avg_accepts = [s['avg_accept_len'] for s in all_stats] # 平均接受长度
+    valid_losses = [s['avg_loss'] for s in all_stats if s['avg_loss'] is not None]
+
+    os.makedirs(os.path.dirname(stat_file), exist_ok=True)
+    
+    with open(stat_file, "w") as f:
+        # === 1. 总体统计 (Global Stats) ===
+        f.write("="*80 + "\n")
+        f.write(f"Global Statistics (Total Questions: {len(all_stats)})\n")
+        f.write("="*80 + "\n\n")
+
+        # 辅助打印函数
+        def write_metric(name, data, is_percent=False):
+            if not data:
+                f.write(f"[{name}]\n  No data.\n\n")
+                return
+            fmt = ".2%" if is_percent else ".4f"
+            f.write(f"[{name}]\n")
+            f.write(f"  Mean:   {np.mean(data):{fmt}}\n")
+            f.write(f"  Median: {np.median(data):{fmt}}\n")
+            f.write(f"  Max:    {np.max(data):{fmt}}\n")
+            f.write(f"  Min:    {np.min(data):{fmt}}\n\n")
+
+        write_metric("Speed (tokens/s)", speeds)
+        write_metric("Acceptance Rate (Accepted/Drafted)", acc_rates, is_percent=True)
+        write_metric("Avg Accept Length (per step)", avg_accepts)
+        
+        if valid_losses:
+            f.write(f"[Online Loss]\n")
+            f.write(f"  Mean:   {np.mean(valid_losses):.6f}\n")
+            f.write(f"  Median: {np.median(valid_losses):.6f}\n")
+            f.write(f"  Max:    {np.max(valid_losses):.6f}\n")
+            f.write(f"  Min:    {np.min(valid_losses):.6f}\n\n")
+        else:
+            f.write(f"[Online Loss]\n  No loss data recorded.\n\n")
+
+        # === 2. 详细统计 (Per Question) ===
+        f.write("="*100 + "\n")
+        f.write("Per Question Details\n")
+        f.write("="*100 + "\n")
+        
+        # 表头：增加了 Acc Rate 和 Total Acc Tokens
+        header = f"{'Question ID':<12} | {'Speed(t/s)':<10} | {'Acc Rate':<10} | {'Avg Acc Len':<12} | {'Tot Acc Tok':<12} | {'Avg Loss':<10} | {'Time(s)':<8}"
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for s in all_stats:
+            loss_str = f"{s['avg_loss']:.4f}" if s['avg_loss'] is not None else "N/A"
+            line = (f"{s['qid']:<12} | {s['speed']:<10.2f} | {s['acc_rate']:<10.2%} | "
+                    f"{s['avg_accept_len']:<12.2f} | {s['total_accept_tokens']:<12} | "
+                    f"{loss_str:<10} | {s['time']:<8.2f}")
+            f.write(line + "\n")
+    
+    print(f"Statistics saved to {stat_file}")
 
 
 if __name__ == "__main__":
@@ -398,6 +524,10 @@ if __name__ == "__main__":
         default="mc_sim_7b_63",
     )
 
+    parser.add_argument("--enable-online-adaptation", action="store_true")
+    parser.add_argument("--adaptation-lr", type=float, default=5e-5)
+    parser.add_argument("--adaptation-temperature", type=float, default=1.0)
+
     args = parser.parse_args()
 
     args.model_id = args.model_id + "-temperature-" + str(args.temperature)
@@ -410,7 +540,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}/{args.model_id}.jsonl"
+        answer_file = f"{args.bench_name}_online/{args.model_id}.jsonl"
 
     print(f"Output to {answer_file}")
 
