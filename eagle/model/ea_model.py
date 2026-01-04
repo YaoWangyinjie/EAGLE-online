@@ -168,6 +168,7 @@ class EaModel(nn.Module):
         # 训练模式
         self.ea_layer.train()
 
+        accepted_indices = retrieve_indices[best_candidate, :accept_length + 1] 
         accepted_tokens = candidates[best_candidate, :accept_length + 1] # 被选中的原始token id
         target_logits = logits[best_candidate, :accept_length + 1] # best candidate路径中的预测logits
 
@@ -184,164 +185,144 @@ class EaModel(nn.Module):
         if prompt_hidden_states.device != device:
             prompt_hidden_states = prompt_hidden_states.to(device)
         
-        input_tokens = torch.cat([input_ids[0] ,accepted_tokens]).unsqueeze(0)    # 不用改
+        # 构造错位输入 (Shifted Input) 符合 EAGLE 结构
+        # Input Tokens: [x_1, x_2, ..., x_k] (从第2个token开始)
+        # Input Hidden: [h_0, h_1, ..., h_{k-1}] (从第1个特征开始)
+        # Target Logits: [p_1, p_2, ..., p_k] (Base Model 在 x_1...x_k 处的输出)
         
-        target_logits = torch.cat([logits_before, target_logits.unsqueeze(0)], dim=1)
+        # 确保数据在同一设备
+        input_tokens = torch.cat([input_ids[0] ,accepted_tokens]).unsqueeze(0).to(device)
+        full_hidden = torch.cat([prompt_hidden_states, hidden_state_new[:,retrieve_indices][:,best_candidate,:accept_length + 1]],dim=1).to(device)
+        target_logits = torch.cat([logits_before, logits[best_candidate, :accept_length + 1].to(device).float().unsqueeze(0)], dim=1).to(device)
         
+        shifted_input_tokens = input_tokens[:, 1:]
+        shifted_full_hidden = full_hidden[:, :-1, :]
+        # target_logits 已经是筛选过的有效 logits，我们需要确认它的对齐方式
+        shifted_target_logits = target_logits[:, 1:, :]
 
         # 词表映射
         if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
-            t2d = self.ea_layer.t2d.to(device)  # [vocab_size] 布尔数组
+            t2d = self.ea_layer.t2d.to(device)
+            # 裁剪 Target Logits 维度
+            target_logits_answer = shifted_target_logits
+            target_max_token = target_logits_answer.argmax(dim=-1)
+            valid_token_mask = t2d[target_max_token]
+            valid_for_training = valid_token_mask.bool()
             
-            with torch.no_grad():
-                # 检查 Base Model 的 Top-1 预测是否在 Draft 词表中
-                target_max_token = target_logits.argmax(dim=-1)  # [num_valid]
-                valid_token_mask = t2d[target_max_token]  # [num_valid] 布尔值
+            if valid_for_training.sum() == 0:
+                 # 恢复环境并返回
+                self.ea_layer.tree_mask = saved_tree_mask
+                self.ea_layer.stable_kv = saved_stable_kv
+                self.ea_layer.to(original_dtype)
+                self.ea_layer.train(was_training)
+                return 0.0
 
-                # 只保留 Base Model 预测在 Draft 词表中的位置
-                valid_for_training = valid_token_mask.bool()
-
-                if valid_for_training.sum() == 0:
-                    # 如果没有有效token，跳过训练
-                    self.ea_layer.tree_mask = saved_tree_mask
-                    self.ea_layer.stable_kv = saved_stable_kv
-                    self.ea_layer.to(original_dtype)
-                    self.ea_layer.train(was_training)
-                    return 0.0
-
-                # 过滤数据：只保留有效位置
-                training_indices = torch.where(valid_for_training[0])[0]
-                target_logits_filtered = target_logits[:,training_indices]  # [num_train, vocab_size=128k]
-                target_logits = target_logits_filtered[..., t2d]
+            # 筛选有效 Token
+            # 注意：这里的 shifted_input_tokens 也需要根据有效性筛选吗？
+            # 严格来说，训练时是一个 batch。如果我们只取一部分有效 token，就会破坏 batch 结构（sequence 变短或不连续）。
+            # 但在这里，我们可以简单地只计算有效位置的 loss。
+            # 不过为了 forward 简单，我们传入完整的 shifted_input_tokens，但在算 loss 时只取有效位置。
+            
+            # 这里先不筛选 Input/Hidden，只在 Loss 阶段筛选
+            pass
         else:
-            if target_logits.shape[-1] > self.draft_vocab_size:
-                target_logits = target_logits[..., :self.draft_vocab_size]
-        
-        
-        # 确保target_logits在正确设备和类型
-        target_logits = target_logits.to(device).float()
+             if shifted_target_logits.shape[-1] > self.draft_vocab_size:
+                shifted_target_logits = shifted_target_logits[..., :self.draft_vocab_size]
 
-        hidden_states_after = hidden_state_new[:,retrieve_indices][:,best_candidate,:accept_length + 1]
-        full_hidden = torch.cat([prompt_hidden_states, hidden_states_after],dim=1)
         # 这里开始训练
         total_loss = 0.0
         with torch.enable_grad():
             for step in range(train_steps):
                 self.adapter_optimizer.zero_grad()
 
-                # target_outputs = self.base_model(input_tokens_batch)
-                layer_outputs = self.ea_layer(
-                    input_ids=input_tokens,
-                    hidden_states=full_hidden,
-                    use_cache=False
+                # 手动 Forward，绕过 cnets.Model.forward 的 dataprepare 和 Loop
+                # 1. Embeddings
+                inputs_embeds = self.ea_layer.embed_tokens(shifted_input_tokens)
+                
+                # 2. Hidden Projection
+                current_hidden = shifted_full_hidden
+                if current_hidden.shape[-1] != inputs_embeds.shape[-1]:
+                     current_hidden = self.ea_layer.fc(current_hidden)
+
+                # 3. Mask (Causal)
+                batch_size, seq_len, _ = inputs_embeds.shape
+                attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.bool)
+                extended_attention_mask = self.ea_layer._prepare_decoder_attention_mask(
+                    attention_mask, (batch_size, seq_len), inputs_embeds, 0
                 )
 
-                # draft_hidden_out = layer_outputs[0]  # [1, seq_length, hidden_size]
-                draft_hidden_out = layer_outputs
-                draft_logits = self.ea_layer.lm_head(self.ea_layer.norm(draft_hidden_out))
+                # 4. MidLayer Forward
+                layer_outputs = self.ea_layer.midlayer(
+                    input_emb=inputs_embeds,
+                    hidden_states=current_hidden,
+                    attention_mask=extended_attention_mask,
+                    use_cache=False
+                )
+                draft_hidden_out = layer_outputs[0]
 
-                # draft_logits[i] 预测 token[i+1]，所以draft_logits[context_len-1]预测第一个input_token
-                output_start = context_len - 1
-                output_end = context_len - 1 + num_valid
-            
-                if output_end > draft_logits.shape[0]:
-                    output_end = draft_logits.shape[0]
-                    num_valid_actual = output_end - output_start
-                    if num_valid_actual <= 0:
-                        continue
-                    # 同步裁剪target_logits
-                    target_logits = target_logits[:num_valid_actual]
-                
-                draft_logits = draft_logits[output_start:output_end]  # [num_valid, draft_vocab_size]
+                # 5. Logits
+                draft_hidden_out = self.ea_layer.norm(draft_hidden_out)
+                draft_logits = self.ea_layer.lm_head(draft_hidden_out)
 
-                # ========== 关键调试点 ==========
-                print(f"\n{'='*50}")
-                print(f"训练过程调试")
-                print(f"{'='*50}")
-                print(f"draft_logits shape: {draft_logits.shape}")
-                print(f"target_logits shape: {target_logits.shape}")
+                # 6. Loss Calculation
+                target_logits_step = shifted_target_logits
                 
-                # 检查 draft 和 target 的预测是否一致
+                # 如果有词表映射，进行筛选
+                if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
+                     # 映射 Target Logits 到 Draft 词表
+                     target_logits_step = target_logits_step[..., t2d]
+                     
+                     # 筛选有效位置 (valid_for_training)
+                     # valid_for_training shape: [1, seq_len]
+                     draft_logits_valid = draft_logits[valid_for_training]
+                     target_logits_valid = target_logits_step[valid_for_training]
+                else:
+                    draft_logits_valid = draft_logits
+                    target_logits_valid = target_logits_step
+
+                # 确保形状匹配
+                if draft_logits_valid.shape[-1] != target_logits_valid.shape[-1]:
+                     min_v = min(draft_logits_valid.shape[-1], target_logits_valid.shape[-1])
+                     draft_logits_valid = draft_logits_valid[..., :min_v]
+                     target_logits_valid = target_logits_valid[..., :min_v]
+
+                # KL Divergence
+                target_probs = F.softmax(target_logits_valid, dim=-1)
+                draft_log_probs = F.log_softmax(draft_logits_valid, dim=-1)
+                loss_fn = torch.nn.KLDivLoss(reduction='batchmean')
+                loss = loss_fn(draft_log_probs, target_probs)
+                
+                # ========== 调试输出 (保留关键信息) ==========
                 with torch.no_grad():
-                    draft_top1 = draft_logits.argmax(dim=-1)
-                    target_top1 = target_logits.argmax(dim=-1)
-                    print(f"Draft top-1 预测: {draft_top1.tolist()}")
-                    print(f"Target top-1 预测: {target_top1.tolist()}")
+                    # 1. 计算 Top-1 预测
+                    draft_pred = draft_logits_valid.argmax(dim=-1)
+                    target_pred = target_logits_valid.argmax(dim=-1)
                     
-                    # 检查有多少预测是一致的
-                    match_count = (draft_top1 == target_top1).sum().item()
-                    total_count = len(draft_top1)
-                    print(f"预测一致数: {match_count}/{total_count}")
+                    # 2. 计算一致率
+                    match_mask = (draft_pred == target_pred)
+                    match_count = match_mask.sum().item()
+                    total_count = match_mask.numel()
+                    accuracy = match_count / total_count if total_count > 0 else 0.0
                     
-                    # 检查 logits 的数值范围
-                    print(f"Draft logits 范围: [{draft_logits.min().item():.2f}, {draft_logits.max().item():.2f}]")
-                    print(f"Target logits 范围: [{target_logits.min().item():.2f}, {target_logits.max().item():.2f}]")
+                    # 3. 打印信息
+                    print(f"\n[Online Adaptation Step {step+1}/{train_steps}]")
+                    print(f"  Loss: {loss.item():.6f}")
+                    print(f"  Acc : {accuracy:.2%} ({match_count}/{total_count})")
+                    print(f"  Draft Pred : {draft_pred.tolist()}")
+                    print(f"  Target Pred: {target_pred.tolist()}")
+                # ==========================================
 
-                    # 检查 softmax 后的概率
-                    draft_probs = F.softmax(draft_logits, dim=-1)
-                    target_probs = F.softmax(target_logits, dim=-1)
-                    print(f"Draft top-1 概率: {draft_probs.max(dim=-1).values.tolist()}")
-                    print(f"Target top-1 概率: {target_probs.max(dim=-1).values.tolist()}")
-                # ========== 调试结束 ==========
-                
-                if draft_logits.shape[-1] != target_logits.shape[-1]:
-                    min_vocab = min(draft_logits.shape[-1], target_logits.shape[-1])
-                    draft_logits = draft_logits[..., :min_vocab]
-                    target_logits = target_logits[..., :min_vocab]
-                
-                min_len = min(draft_logits.shape[0], target_logits.shape[0])
-                
-                draft_logits = draft_logits[:min_len]
-                target_logits = target_logits[:min_len]
-                temp = self.adaptation_temperature
-                
-                log_p = F.log_softmax(draft_logits / temp, dim=-1)
-                q = F.softmax(target_logits / temp, dim=-1)
-                
-                kl_per_element = F.kl_div(log_p, q, reduction='none')  # [num_valid, vocab_size]
-                kl_per_token = kl_per_element.sum(dim=-1)  # [num_valid]
-                loss = kl_per_token.mean() * (temp ** 2)
-                
                 if torch.isnan(loss) or torch.isinf(loss):
                     print("Invalid loss")
-                else:
-                    print(f"[Adaptation] Loss: {loss.item()}")
-
+                
                 loss.backward()
-
-                # ========== 梯度检查 ==========
-                grad_norms = []
-                for name, param in self.ea_layer.named_parameters():
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                        grad_norms.append((name, grad_norm))
-                
-                # 打印梯度最大的几个参数
-                grad_norms.sort(key=lambda x: x[1], reverse=True)
-                print(f"\n梯度最大的5个参数:")
-                for name, norm in grad_norms[:5]:
-                    print(f"  {name}: {norm:.6f}")
-                
-                total_grad_norm = sum(n for _, n in grad_norms)
-                print(f"总梯度范数: {total_grad_norm:.6f}")
-                # ========== 梯度检查结束 ==========
 
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.ea_layer.parameters() if p.requires_grad],
                     max_norm=1.0
                 )
 
-                # ========== 权重更新前后检查 ==========
-                # 记录更新前的 lm_head 权重
-                lm_head_before = self.ea_layer.lm_head.weight.data.clone()
-                
                 self.adapter_optimizer.step()
-
-                # 检查权重变化
-                lm_head_after = self.ea_layer.lm_head.weight.data
-                weight_change = (lm_head_after - lm_head_before).abs().mean().item()
-                print(f"lm_head 权重平均变化: {weight_change:.8f}")
-                # ========== 权重检查结束 ==========
 
                 total_loss += loss.item()
         
@@ -514,6 +495,7 @@ class EaModel(nn.Module):
 
         total_accept_length = 0
         total_steps = 0
+        total_drafted_tokens = 0
 
         padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
         input_ids = input_ids.clone()
@@ -578,6 +560,7 @@ class EaModel(nn.Module):
             
             total_accept_length += accept_length
             total_steps += 1
+            total_drafted_tokens += candidates.shape[1] 
 
             if use_adaptation and self.adapter_optimizer is not None and not self.first_token_adapted: 
                 if accept_length > 0:
@@ -600,7 +583,8 @@ class EaModel(nn.Module):
 
                     self.first_token_adapted = True
                     print("One time online adaptation completed!")
-
+                else:
+                    self.first_token_adapted = True
             with torch.no_grad():
                 input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                     input_ids,
@@ -634,9 +618,16 @@ class EaModel(nn.Module):
 
         # print online info
         if use_adaptation and adaptation_info['adaptation_count'] > 0:
-                print(f"[Online Adaptation] loss={adaptation_info['losses'][0]:.4f}")
+            print(f"[Online Adaptation] loss={adaptation_info['losses'][0]:.4f}")
+
+        run_stats = {
+            "total_accept_length": total_accept_length,
+            "total_drafted_tokens": total_drafted_tokens, # 用于计算接受率
+            "total_steps": total_steps,
+            "losses": adaptation_info['losses'] if use_adaptation else []
+        }
 
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx
+            return input_ids, new_token, idx, run_stats
