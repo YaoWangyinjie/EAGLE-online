@@ -6,6 +6,7 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 import argparse
 import json
 import os
+import numpy as np
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"
@@ -358,6 +359,8 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
+
+    return local_stats
 
 
 def reorg_answer_file(answer_file):
