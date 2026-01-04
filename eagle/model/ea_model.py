@@ -287,10 +287,11 @@ class EaModel(nn.Module):
                      target_logits_valid = target_logits_valid[..., :min_v]
 
                 # KL Divergence
-                target_probs = F.softmax(target_logits_valid, dim=-1)
-                draft_log_probs = F.log_softmax(draft_logits_valid, dim=-1)
+                target_probs = F.softmax(target_logits_valid / const_temp, dim=-1)
+                draft_log_probs = F.log_softmax(draft_logits_valid / const_temp, dim=-1)
                 loss_fn = torch.nn.KLDivLoss(reduction='batchmean')
                 loss = loss_fn(draft_log_probs, target_probs)
+                loss = loss * (const_temp ** 2)
                 
                 # ========== 调试输出 (保留关键信息) ==========
                 with torch.no_grad():
