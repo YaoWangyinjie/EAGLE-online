@@ -6,18 +6,28 @@ python -m EAGLE-online.eagle.evaluation.gen_ea_answer_llama3chat \
 --enable-online-adaptation \
 --model-id 0
 
+python -m EAGLE-online.eagle.evaluation.gen_ea_answer_ds \
+--ea-model-path model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/ \
+--base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
+--enable-online-adaptation \
+--model-id 0
+
 baseline:
-python -m EAGLE.eagle.evaluation.gen_ea_answer_llama3chat \
+python -m EAGLE-main.eagle.evaluation.gen_ea_answer_llama3chat \
 --ea-model-path model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/ \
 --base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
 --use_eagle3 \
+--model-id 0
+
+python -m EAGLE-main.eagle.evaluation.gen_ea_answer_ds \
+--ea-model-path model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/ \
+--base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
 --model-id 0
 
 outside:
 /mt_bench
 /mt_bench_online
 /model_weight: download from github
-/analysis_report
 
 每次clone后修改：
 gen_ea_answer_llama3chat.py中可用gpu数量
