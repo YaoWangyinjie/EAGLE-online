@@ -9,7 +9,7 @@ import os
 import numpy as np
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 from accelerate.utils import set_seed
 set_seed(0)
 
@@ -359,7 +359,7 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
-
+        
     return local_stats
 
 
@@ -543,7 +543,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}_online/{args.model_id}.jsonl"
+        answer_file = f"ds_{args.bench_name}_online/{args.model_id}.jsonl"
 
     print(f"Output to {answer_file}")
 
