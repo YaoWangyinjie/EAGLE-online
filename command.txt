@@ -6,10 +6,17 @@ python -m EAGLE-online.eagle.evaluation.gen_ea_answer_llama3chat \
 --enable-online-adaptation \
 --model-id 0
 
-python -m EAGLE-online.eagle.evaluation.gen_ea_answer_ds \
+CUDA_VISIBLE_DEVICES=7 python -m EAGLE-online.eagle.evaluation.gen_ea_answer_ds \
 --ea-model-path model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B/ \
 --base-model-path model_weight/DeepSeek-R1-Distill-Llama-8B/ \
 --enable-online-adaptation \
+--model-id 0
+
+CUDA_VISIBLE_DEVICES=7 python -m EAGLE-online.eagle.evaluation.gen_ea_answer_vicuna \
+--ea-model-path model_weight/EAGLE3-Vicuna1.3-13B/ \
+--base-model-path model_weight/vicuna-13b-v1.3/ \
+--enable-online-adaptation \
+--use-eagle3 \
 --model-id 0
 
 baseline:
@@ -37,3 +44,5 @@ gen_ea_answer_llama3chat.py中可用gpu数量
 解决问题：
 当下逻辑：对每个question在第一次吐出token时做一次线上训练，此后不再训练直接推理
 超参：lr，temperature
+
+一句完整的question的全部accept tokens用于训练；若干句作为一个batch训练；若干句挑出top-k句训练
