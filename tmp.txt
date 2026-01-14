@@ -1,0 +1,27 @@
+[Online Adaptation Prefill Step 1/1]
+  Loss: 7.692005
+  Acc : 7.69% (2/26)
+[Stats] Total Iteration Steps: 92, Total Accepted: 424
+[Online Adaptation] Prefill loss=7.6920
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/root/paddlejob/workspace/env_run/EAGLE-online/eagle/evaluation/gen_ea_answer_ds.py", line 550, in <module>
+    run_eval(
+  File "/root/paddlejob/workspace/env_run/EAGLE-online/eagle/evaluation/gen_ea_answer_ds.py", line 71, in run_eval
+    get_answers_func(
+  File "/root/paddlejob/workspace/env_run/EAGLE-online/eagle/evaluation/gen_ea_answer_ds.py", line 179, in get_model_answers
+    output_ids, new_token, idx, warmup_stats = model.eagenerate(
+  File "/root/paddlejob/workspace/env_run/EAGLE-online/eagle/model/ea_modelnew.py", line 470, in eagenerate
+    base_outputs = self.base_model.model(
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/root/paddlejob/workspace/env_run/EAGLE-online/eagle/model/modeling_llama_kv.py", line 1116, in forward
+    attention_mask = self._prepare_decoder_attention_mask(
+  File "/root/paddlejob/workspace/env_run/EAGLE-online/eagle/model/modeling_llama_kv.py", line 1039, in _prepare_decoder_attention_mask
+    combined_attention_mask[:, :, -tree_len:, -tree_len:][
+IndexError: The shape of the mask [1, 1, 60, 60] at index 2 does not match the shape of the indexed tensor [1, 1, 27, 27] at index 2
