@@ -147,7 +147,7 @@ class EaModel(nn.Module):
 
         # 这里保存tree_mask和kv_cache以供后续恢复，训练时禁用以防kv_cache被污染以及tree_mask影响训练
         saved_tree_mask = getattr(self.ea_layer, 'tree_mask', None)
-        saved_stable_kv = self.ea_layer.stable_kv
+        saved_stable_kv = getattr(self.ea_layer, 'stable_kv', None)
         self.ea_layer.reset()
         self.ea_layer.stable_kv = None
 
@@ -467,6 +467,9 @@ class EaModel(nn.Module):
             with torch.no_grad():
                 # 为了训练，我们需要 Logits，所以不能只调 model.model，要调完整的 forward 或者手动计算 head
                 # 这里调用 model.model 拿 hidden_states，再手动计算 logits
+                if hasattr(self.base_model.model, "tree_mask"):
+                    self.base_model.model.tree_mask = None
+                    
                 base_outputs = self.base_model.model(
                     input_ids=input_ids,
                     use_cache=True # 也许可以复用 KV，但在 initialize_tree 中逻辑较复杂，这里先独立运行以求稳健
