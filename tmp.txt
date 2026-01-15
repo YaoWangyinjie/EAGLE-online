@@ -466,9 +466,21 @@ class EaModel(nn.Module):
 
                 base_outputs = self.base_model.model(
                     input_ids=input_ids,
-                    use_cache=True 
+                    use_cache=True,
+                    output_hidden_states=True
                 )
-                prefill_hidden_states = base_outputs[0].cpu() # 存到 CPU 节省显存
+                
+                if self.use_eagle3:
+                    # 为了与 utils.py 中的 tree_decoding 逻辑保持严格一致 (line 328)，我们拼接所有返回的 hidden_states
+                    # utils.py: hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
+                    # 注意：这里假设 base_model 配置返回的 hidden_states 正是 EAGLE-3 所需的那几层（通常是后3层）
+                    # 如果 base_model 返回所有层，这里的逻辑需要确保只取最后3层，但为了保险起见，我们模仿 utils.py 的行为
+                    # 或者更稳健的做法：既然报错显示 hidden_state_new 是 12288 (3*4096)，我们就强制取后3层
+                    prefill_hidden_states = torch.cat(base_outputs.hidden_states[-3:], dim=-1).cpu()
+                else:
+                    # EAGLE-1/2 只用最后一层 (4096 dim)
+                    prefill_hidden_states = base_outputs[0].cpu()
+                
                 prefill_logits = self.base_model.lm_head(base_outputs[0]).cpu()
                 prefill_tokens = input_ids.cpu()
                 
@@ -563,10 +575,18 @@ class EaModel(nn.Module):
                      first_hidden = first_hidden.cpu()
                  
                  if accept_length > 0:
-                     # rest_hidden: 从 hidden_state_new 中按路径取
-                     # hidden_state_new 是 GPU Tensor，需要转 CPU
+                     # rest_hidden: 从 outputs 中按路径取
+                     # 关键修复：必须根据 use_eagle3 决定提取维度，以匹配 Draft Model 的输入要求
+                     if self.use_eagle3:
+                         # EAGLE-3: 拼接最后 3 层 (12288 dim)
+                         # 注意：utils.py 中 tree_decoding 返回的 outputs 包含 hidden_states
+                         raw_tree_hidden = torch.cat(outputs.hidden_states[-3:], dim=-1)
+                     else:
+                         # EAGLE-1/2: 只用最后一层 (4096 dim)
+                         raw_tree_hidden = outputs[0]
+                     
                      accepted_indices = retrieve_indices[best_candidate, :accept_length]
-                     rest_hidden = hidden_state_new[:, accepted_indices, :].cpu()
+                     rest_hidden = raw_tree_hidden[:, accepted_indices, :].cpu()
                      step_hidden = torch.cat([first_hidden, rest_hidden], dim=1)
                  else:
                      step_hidden = first_hidden
@@ -608,8 +628,9 @@ class EaModel(nn.Module):
                 )
             
             # 更新 last_step_hidden 用于下一次收集
+            # 直接使用当前 step 拼接好的最后一个 hidden，确保维度一致 (4096)
             if is_collecting:
-                last_step_hidden = hidden_state.cpu()
+                last_step_hidden = step_hidden[:, -1:, :]
 
             # === 触发训练 ===
             if is_collecting and total_steps == warmup_steps:
