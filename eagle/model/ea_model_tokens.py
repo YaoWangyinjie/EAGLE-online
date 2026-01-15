@@ -591,52 +591,21 @@ class EaModel(nn.Module):
                  else:
                      step_hidden = first_hidden
                      
-                 # 构造对应的 Target Logits
-                 # logits 是 GPU Tensor，需要转 CPU
-                 # 注意：step_logits 对应的是 Draft Tokens 的预测结果，不包含 Root 的预测结果
-                 # 所以它天然对应于 step_accepted_tokens[1:] 的后续预测
-                 step_logits = logits[best_candidate, :accept_length + 1, :].unsqueeze(0).cpu()
-
-                 # === 关键修复：去重拼接 ===
-                 # step_accepted_tokens[0] 是 Root (即上一轮的最后一个 token)
-                 # step_hidden[0] 是 Root 的 Hidden
-                 # prefill 已经提供了这些，如果我们直接 append，会导致序列中出现重复 (t_0, t_0)
-                 # 从而导致 input 和 target (logits) 发生错位
-                 
-                 # 我们只追加新产生的部分 [1:]
-                 collected_tokens.append(step_accepted_tokens[1:].cpu().unsqueeze(0))
-                 collected_hiddens.append(step_hidden[:, 1:, :]) # step_hidden 已经是 CPU
                  
                  if step_accepted_tokens.shape[0] > 1: # 只有产生了新 token 才收集
                      # 切掉 Root
                      new_tokens = step_accepted_tokens[1:]
                      new_hiddens = step_hidden[:, 1:, :]
                      
-                     # Logits 对应这些新 token 的预测结果（作为 Target）
-                     # 或者是新 token 对应的输出？
-                     # Training: Input d1 -> Target L_d1 (pred d2).
-                     # So if we append d1, we need L_d1.
-                     # logits[0] is L_d1.
-                     # So we take :accept_length.
-                     
-                     # Wait, previous code took :accept_length + 1.
-                     # If logits size is same as candidates size (e.g. 10).
-                     # candidates include drafts.
-                     # logits include predictions FROM drafts.
-                     
                      num_new = new_tokens.shape[0] # accept_length
+                     
+                     # 取出对应长度的 Logits
                      current_step_logits = logits[best_candidate, :num_new, :].unsqueeze(0).cpu()
                      
                      collected_tokens.append(new_tokens.cpu().unsqueeze(0))
                      collected_hiddens.append(new_hiddens)
                      collected_logits.append(current_step_logits)
                  
-                 # 更新 last_step_hidden 为当前路径最后一个 token 的 hidden
-                 # sample_p 对应的是最后一个被接受 token 之后的位置（用于预测下一个），但 hidden_state_new 包含的是 accepted tokens 的输出
-                 # 实际上，我们需要下一个 step 的 input hidden，即当前 step 最后一个被接受 token 的 hidden
-                 # 在 evaluate_posterior 之后，update_inference_inputs 会计算 hidden_state (即 last hidden of the sequence)
-                 # 但我们需要在 update_inference_inputs 之前自己算一下，或者等 update 之后拿？
-                 # update_inference_inputs 会返回 hidden_state，我们直接用那个更新
                  pass
 
             total_accept_length += accept_length
