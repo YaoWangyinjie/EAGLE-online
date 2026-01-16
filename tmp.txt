@@ -58,7 +58,7 @@
   draft_logits.shape: torch.Size([1, 86, 32000])
   draft_logits range: [-15.54, 43.83], mean: 2.01
   target_logits_step.shape: torch.Size([1, 86, 128256])
-  target_logits_step range: [-15.09, 39.56], mean: -2.05
+  target_logits_step range: [-15.09, 39.56], mean: -2.03
 
 [DEBUG Step 1] Vocab Mapping 检查
   has_vocab_mapping: True
@@ -70,17 +70,17 @@
   匹配后: draft=torch.Size([86, 32000]), target=torch.Size([86, 32000])
 
 [DEBUG Step 1] 概率分布检查
-  target_probs max值: 0.8164 (应该接近1)
+  target_probs max值: 0.8016 (应该接近1)
   draft_probs max值: 0.5023
-  target top-5 概率和: 0.9456
+  target top-5 概率和: 0.9445
   draft top-5 概率和: 0.6873
     位置0: Draft预测=21946, Target=31998, 匹配=False
     位置1: Draft预测=185, Target=170, 匹配=False
     位置2: Draft预测=4381, Target=7022, 匹配=False
-  KL Loss (raw): 9.331688
+  KL Loss (raw): 2.566305
 
 [Online Adaptation Step 1/1]
-  Loss: 9.331688
-  Acc : 5.81% (5/86)
-[Stats] Total Iteration Steps: 92, Total Accepted: 423
-[Online Adaptation] Warmup loss=9.3317
+  Loss: 2.566305
+  Acc : 47.67% (41/86)
+[Stats] Total Iteration Steps: 98, Total Accepted: 421
+[Online Adaptation] Warmup loss=2.5663
