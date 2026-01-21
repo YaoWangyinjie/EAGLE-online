@@ -238,7 +238,7 @@ class EaModel(nn.Module):
 
             pass
         else:
-             if shifted_target_logits.shape[-1] > self.draft_vocab_size:
+            if shifted_target_logits.shape[-1] > self.draft_vocab_size:
                 shifted_target_logits = shifted_target_logits[..., :self.draft_vocab_size]
 
         # ========== 训练前 Baseline 检查 ==========
@@ -314,16 +314,16 @@ class EaModel(nn.Module):
                     print(f"  需要 FC? {current_hidden.shape[-1] != inputs_embeds.shape[-1]}")
                 
                 if current_hidden.shape[-1] != inputs_embeds.shape[-1]:
-                     if const_enable_debug:
-                         current_hidden_before = current_hidden.clone()
-                     current_hidden = self.ea_layer.fc(current_hidden)
-                     if const_enable_debug:
-                         print(f"  FC 前维度: {current_hidden_before.shape}")
-                         print(f"  FC 后维度: {current_hidden.shape}")
-                         print(f"  FC 权重维度: {self.ea_layer.fc.weight.shape}")
+                    if const_enable_debug:
+                        current_hidden_before = current_hidden.clone()
+                    current_hidden = self.ea_layer.fc(current_hidden)
+                    if const_enable_debug:
+                        print(f"  FC 前维度: {current_hidden_before.shape}")
+                        print(f"  FC 后维度: {current_hidden.shape}")
+                        print(f"  FC 权重维度: {self.ea_layer.fc.weight.shape}")
                 else:
-                     if const_enable_debug:
-                         print(f"  警告: FC 层被跳过! Hidden 和 Embedding 维度相同!")
+                    if const_enable_debug:
+                        print(f"  警告: FC 层被跳过! Hidden 和 Embedding 维度相同!")
                 
                 if const_enable_debug:
                     print()
@@ -367,16 +367,16 @@ class EaModel(nn.Module):
                     print(f"  base_vocab_size: {self.vocab_size}")
                 
                 if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
-                     if const_enable_debug:
-                         print(f"  使用 Vocab Mapping")
-                         print(f"  valid_for_training.sum(): {valid_for_training.sum().item()} / {valid_for_training.numel()}")
+                    if const_enable_debug:
+                        print(f"  使用 Vocab Mapping")
+                        print(f"  valid_for_training.sum(): {valid_for_training.sum().item()} / {valid_for_training.numel()}")
                      
-                     # 映射 Target Logits 到 Draft 词表
-                     target_logits_step = target_logits_step[..., t2d]
+                    # 映射 Target Logits 到 Draft 词表
+                    target_logits_step = target_logits_step[..., t2d]
                      
-                     # 筛选有效位置 (valid_for_training)
-                     draft_logits_valid = draft_logits[valid_for_training]
-                     target_logits_valid = target_logits_step[valid_for_training]
+                    # 筛选有效位置 (valid_for_training)
+                    draft_logits_valid = draft_logits[valid_for_training]
+                    target_logits_valid = target_logits_step[valid_for_training]
                 else:
                     if const_enable_debug:
                         print(f"  不使用 Vocab Mapping")
@@ -387,11 +387,11 @@ class EaModel(nn.Module):
                 if const_enable_debug:
                     print(f"  匹配前: draft={draft_logits_valid.shape}, target={target_logits_valid.shape}")
                 if draft_logits_valid.shape[-1] != target_logits_valid.shape[-1]:
-                     if const_enable_debug:
-                         print(f"  警告: 维度不匹配，进行截断")
-                     min_v = min(draft_logits_valid.shape[-1], target_logits_valid.shape[-1])
-                     draft_logits_valid = draft_logits_valid[..., :min_v]
-                     target_logits_valid = target_logits_valid[..., :min_v]
+                    if const_enable_debug:
+                        print(f"  警告: 维度不匹配，进行截断")
+                    min_v = min(draft_logits_valid.shape[-1], target_logits_valid.shape[-1])
+                    draft_logits_valid = draft_logits_valid[..., :min_v]
+                    target_logits_valid = target_logits_valid[..., :min_v]
                 if const_enable_debug:
                     print(f"  匹配后: draft={draft_logits_valid.shape}, target={target_logits_valid.shape}")
 
@@ -758,9 +758,9 @@ class EaModel(nn.Module):
         # 这样比依赖 initialize_tree 的返回值更稳健（且保证在 CPU 上，与 collected_hiddens 匹配）
         if is_collecting:
              # prefill_hidden_states shape: [1, seq_len, hidden_dim]
-             last_step_hidden = prefill_hidden_states[:, -1:, :]
+            last_step_hidden = prefill_hidden_states[:, -1:, :]
         else:
-             last_step_hidden = None
+            last_step_hidden = None
 
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
@@ -806,20 +806,20 @@ class EaModel(nn.Module):
             
             # === 数据收集逻辑 ===
             if is_collecting and total_steps < warmup_steps:
-                 # 获取当前 step 被接受的 tokens（包含树根）
-                 # candidates: [1, tree_nodes] -> candidates[best_candidate] 是最优路径的 token id
+                # 获取当前 step 被接受的 tokens（包含树根）
+                # candidates: [1, tree_nodes] -> candidates[best_candidate] 是最优路径的 token id
                  
-                 # step_accepted_tokens: [accept_length+1]
-                 step_accepted_tokens = candidates[best_candidate, :accept_length + 1]
+                # step_accepted_tokens: [accept_length+1]
+                step_accepted_tokens = candidates[best_candidate, :accept_length + 1]
                  
-                 # 构造对应的 Hidden States
-                 # first_hidden: 来自上一轮的 last_step_hidden (Pre-fill end or previous step end)
-                 # 确保 first_hidden 在 CPU 上（如果 last_step_hidden 维护得当，它应该是 CPU Tensor）
-                 first_hidden = last_step_hidden # [1, 1, hidden_dim*3]
-                 if first_hidden.device != torch.device('cpu'):
-                     first_hidden = first_hidden.cpu()
+                # 构造对应的 Hidden States
+                # first_hidden: 来自上一轮的 last_step_hidden (Pre-fill end or previous step end)
+                # 确保 first_hidden 在 CPU 上（如果 last_step_hidden 维护得当，它应该是 CPU Tensor）
+                first_hidden = last_step_hidden # [1, 1, hidden_dim*3]
+                if first_hidden.device != torch.device('cpu'):
+                    first_hidden = first_hidden.cpu()
                  
-                 if accept_length > 0:
+                if accept_length > 0:
                     # rest_hidden: 从 outputs 中按路径取
                     # 关键修复：必须根据 use_eagle3 决定提取维度，以匹配 Draft Model 的输入要求
                     if self.use_eagle3:
@@ -836,41 +836,41 @@ class EaModel(nn.Module):
                     accepted_indices = retrieve_indices[best_candidate, 1:accept_length + 1]
                     rest_hidden = raw_tree_hidden[:, accepted_indices, :].cpu()
                     step_hidden = torch.cat([first_hidden, rest_hidden], dim=1)
-                 else:
+                else:
                     step_hidden = first_hidden
                     
                 
-                 if step_accepted_tokens.shape[0] > 1: # 只有产生了新 token 才收集
+                if step_accepted_tokens.shape[0] > 1: # 只有产生了新 token 才收集
                     # 切掉 Root
-                     new_tokens = step_accepted_tokens[1:]
+                    new_tokens = step_accepted_tokens[1:]
                     # Bug 修复 2: 去掉最后一个 hidden（不是第一个！）
                     # 正确对齐：token[i] + hidden[i-1] → 预测 token[i+1]
                     # new_hiddens = [hidden0, hidden1, ..., hiddenN-1]
                     # new_tokens = [token1, token2, ..., tokenN]
-                     new_hiddens = step_hidden[:, :-1, :]
-                     
-                     num_new = new_tokens.shape[0] # accept_length
-                     
-                     # 取出对应长度的 Logits
-                     # 关键修复: logits[i] 预测的是 candidates[i+1]
-                     # 所以对于 new_tokens[0] (即 candidates[1]), 对应的 Target Logits 是 logits[1] (预测 candidates[2])
-                     # 因此应该取 logits[1:num_new+1] 而不是 logits[:num_new]
-                     current_step_logits = logits[best_candidate, 1:num_new+1, :].unsqueeze(0).cpu()
-                     
-                     collected_tokens.append(new_tokens.cpu().unsqueeze(0))
-                     collected_hiddens.append(new_hiddens)
-                     collected_logits.append(current_step_logits)
-                     
-                     # ========== Debug 输出: Warmup Step 收集 ==========
-                     if const_enable_debug and total_steps == 0:  # 只在第一个 warmup step 打印
-                         print(f"[DEBUG] Warmup Step {total_steps} 数据收集")
-                         print(f"  new_tokens.shape: {new_tokens.shape}")
-                         print(f"  new_hiddens.shape: {new_hiddens.shape}")
-                         print(f"  current_step_logits.shape: {current_step_logits.shape}")
-                         print(f"  step_hidden维度: {step_hidden.shape} (最后一维应与Prefill一致)")
-                         print()
-                 
-                 pass
+                    new_hiddens = step_hidden[:, :-1, :]
+                    
+                    num_new = new_tokens.shape[0] # accept_length
+                    
+                    # 取出对应长度的 Logits
+                    # 关键修复: logits[i] 预测的是 candidates[i+1]
+                    # 所以对于 new_tokens[0] (即 candidates[1]), 对应的 Target Logits 是 logits[1] (预测 candidates[2])
+                    # 因此应该取 logits[1:num_new+1] 而不是 logits[:num_new]
+                    current_step_logits = logits[best_candidate, 1:num_new+1, :].unsqueeze(0).cpu()
+                    
+                    collected_tokens.append(new_tokens.cpu().unsqueeze(0))
+                    collected_hiddens.append(new_hiddens)
+                    collected_logits.append(current_step_logits)
+                    
+                    # ========== Debug 输出: Warmup Step 收集 ==========
+                    if const_enable_debug and total_steps == 0:  # 只在第一个 warmup step 打印
+                        print(f"[DEBUG] Warmup Step {total_steps} 数据收集")
+                        print(f"  new_tokens.shape: {new_tokens.shape}")
+                        print(f"  new_hiddens.shape: {new_hiddens.shape}")
+                        print(f"  current_step_logits.shape: {current_step_logits.shape}")
+                        print(f"  step_hidden维度: {step_hidden.shape} (最后一维应与Prefill一致)")
+                        print()
+                
+                pass
 
             total_accept_length += accept_length
             total_steps += 1
