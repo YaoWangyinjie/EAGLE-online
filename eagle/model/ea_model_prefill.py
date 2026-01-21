@@ -472,10 +472,15 @@ class EaModel(nn.Module):
                     
                 base_outputs = self.base_model.model(
                     input_ids=input_ids,
-                    use_cache=True # 也许可以复用 KV，但在 initialize_tree 中逻辑较复杂，这里先独立运行以求稳健
+                    use_cache=True,
+                    output_hidden_states=True
                 )
-                prefill_hidden_states = base_outputs[0] # [1, seq_len, hidden_dim]
-                prefill_logits = self.base_model.lm_head(prefill_hidden_states) # [1, seq_len, vocab_size]
+                if self.use_eagle3:
+                    prefill_hidden_states = torch.cat(base_outputs.hidden_states[-3:], dim=-1) # [1, seq_len, hidden_dim]
+                else:
+                    prefill_hidden_states = base_outputs[0] # [1, seq_len, hidden_dim]
+
+                prefill_logits = self.base_model.lm_head(base_outputs[0]) # [1, seq_len, vocab_size]
             
             # 3. 执行在线训练
             # print(f"[Online Adaptation] Training on prefill logits (len={input_ids.shape[1]})...")
