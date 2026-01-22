@@ -23,8 +23,9 @@ from .configs import EConfig
 
 const_temp = 1.0
 const_lr = 1e-5
-const_train_steps = 1
+const_train_steps = 1  # 从 5 改为 1，防止过拟合
 const_warmup_steps = 5
+const_enable_debug = False  # ⚠️ 控制是否输出详细 Debug（会影响速度统计！）
 
 class EaModel(nn.Module):
 
@@ -109,22 +110,24 @@ class EaModel(nn.Module):
             adaptation_lr=const_lr, 
             adaptation_temperature=const_temp,
         ):
-        """superparams of online adaptation"""
+        """superparams of online adaptation
+        
+        注意：此函数强制使用 const_lr 作为学习率，忽略 adaptation_lr 参数。
+        如需修改学习率，请直接修改文件顶部的 const_lr = xxx
+        """
         self.enable_online_adaptation = True
-        # self.adaptation_lr = adaptation_lr
-        # self.adaptation_temperature = adaptation_temperature
-        self.adaptation_lr = const_lr
+        # 强制使用 const_lr，忽略外部传入的 adaptation_lr
+        self.adaptation_lr = const_lr  # 修改：原来是 adaptation_lr
         self.adaptation_temperature = const_temp
 
         # 设置梯度
         for param in self.ea_layer.parameters():
             param.requires_grad = True
                 
-        # self.adapter_optimizer = torch.optim.Adam(self.ea_layer.parameters(), lr=adaptation_lr)
+        # 强制使用 const_lr
         self.adapter_optimizer = torch.optim.Adam(
             self.ea_layer.parameters(), 
-            lr=const_lr,
-            # weight_decay=1e-4, # L2正则化
+            lr=const_lr,  # 修改：原来是 adaptation_lr
         )
         
         # 保存初始权重（如果还没有保存过）
@@ -143,15 +146,16 @@ class EaModel(nn.Module):
         device = next(self.ea_layer.parameters()).device
         
         # ========== Debug 输出 1: 输入数据形状 ==========
-        print(f"\n{'='*60}")
-        print(f"[DEBUG] _perform_online_adaptation 输入数据检查")
-        print(f"  all_accepted_tokens.shape: {all_accepted_tokens.shape}")
-        print(f"  all_hidden_states.shape: {all_hidden_states.shape}")
-        print(f"  all_target_logits.shape: {all_target_logits.shape}")
-        print(f"  all_hidden_states.dtype: {all_hidden_states.dtype}")
-        print(f"  all_target_logits.dtype: {all_target_logits.dtype}")
-        print(f"  device: {device}")
-        print(f"{'='*60}\n")
+        if const_enable_debug:
+            print(f"\n{'='*60}")
+            print(f"[DEBUG] _perform_online_adaptation 输入数据检查")
+            print(f"  all_accepted_tokens.shape: {all_accepted_tokens.shape}")
+            print(f"  all_hidden_states.shape: {all_hidden_states.shape}")
+            print(f"  all_target_logits.shape: {all_target_logits.shape}")
+            print(f"  all_hidden_states.dtype: {all_hidden_states.dtype}")
+            print(f"  all_target_logits.dtype: {all_target_logits.dtype}")
+            print(f"  device: {device}")
+            print(f"{'='*60}\n")
 
         # 这里转换数据格式，从bf16到float32以解决训练中爆表的问题，输入也进行转换
         original_dtype = next(self.ea_layer.parameters()).dtype
@@ -191,20 +195,21 @@ class EaModel(nn.Module):
         seq_len = shifted_input_tokens.shape[1]
         
         # ========== Debug 输出 2: Shifted 后的对齐检查 ==========
-        print(f"[DEBUG] Shifted 数据形状")
-        print(f"  shifted_input_tokens.shape: {shifted_input_tokens.shape}")
-        print(f"  shifted_full_hidden.shape: {shifted_full_hidden.shape}")
-        print(f"  shifted_target_logits.shape: {shifted_target_logits.shape}")
-        print(f"  seq_len: {seq_len}")
-        if seq_len > 0:
-            print(f"\n[DEBUG] 前5个Token对齐检查（验证 Input Token -> Target Prediction）")
-            print(f"  原始序列前6个Token: {all_accepted_tokens[0, :6].tolist()}")
-            print(f"  Shifted Input前5个: {shifted_input_tokens[0, :5].tolist()}")
-            # Target Logits 的 argmax 应该对应"下一个Token"
-            target_pred = shifted_target_logits[0, :5].argmax(dim=-1).tolist()
-            print(f"  Target预测(argmax): {target_pred}")
-            print(f"  实际下一个Token:   {all_accepted_tokens[0, 2:7].tolist()}")
-            print(f"  对齐检查: 期望 Target预测 == 实际下一个Token\n")
+        if const_enable_debug:
+            print(f"[DEBUG] Shifted 数据形状")
+            print(f"  shifted_input_tokens.shape: {shifted_input_tokens.shape}")
+            print(f"  shifted_full_hidden.shape: {shifted_full_hidden.shape}")
+            print(f"  shifted_target_logits.shape: {shifted_target_logits.shape}")
+            print(f"  seq_len: {seq_len}")
+            if seq_len > 0:
+                print(f"\n[DEBUG] 前5个Token对齐检查（验证 Input Token -> Target Prediction）")
+                print(f"  原始序列前6个Token: {all_accepted_tokens[0, :6].tolist()}")
+                print(f"  Shifted Input前5个: {shifted_input_tokens[0, :5].tolist()}")
+                # Target Logits 的 argmax 应该对应"下一个Token"
+                target_pred = shifted_target_logits[0, :5].argmax(dim=-1).tolist()
+                print(f"  Target预测(argmax): {target_pred}")
+                print(f"  实际下一个Token:   {all_accepted_tokens[0, 2:7].tolist()}")
+                print(f"  对齐检查: 期望 Target预测 == 实际下一个Token\n")
         
         if seq_len == 0:
             # 恢复环境
@@ -233,9 +238,61 @@ class EaModel(nn.Module):
 
             pass
         else:
-             if shifted_target_logits.shape[-1] > self.draft_vocab_size:
+            if shifted_target_logits.shape[-1] > self.draft_vocab_size:
                 shifted_target_logits = shifted_target_logits[..., :self.draft_vocab_size]
 
+        # ========== 训练前 Baseline 检查 ==========
+        # ⚠️ 警告：此检查会额外执行一次前向传播，显著增加运行时间（+50% 开销）
+        # 仅在 Debug 模式下启用，正式评测时应关闭 const_enable_debug
+        if const_enable_debug:
+            print(f"\n{'='*60}")
+            print(f"[DEBUG] 训练前 Baseline（未经在线训练的 Draft Model）")
+            with torch.no_grad():
+                self.ea_layer.eval()
+                inputs_embeds_baseline = self.ea_layer.embed_tokens(shifted_input_tokens)
+                current_hidden_baseline = shifted_full_hidden
+                if current_hidden_baseline.shape[-1] != inputs_embeds_baseline.shape[-1]:
+                    current_hidden_baseline = self.ea_layer.fc(current_hidden_baseline)
+                
+                batch_size, seq_len, _ = inputs_embeds_baseline.shape
+                attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.bool)
+                extended_attention_mask = self.ea_layer._prepare_decoder_attention_mask(
+                    attention_mask, (batch_size, seq_len), inputs_embeds_baseline, 0
+                )
+                layer_outputs = self.ea_layer.midlayer(
+                    input_emb=inputs_embeds_baseline,
+                    hidden_states=current_hidden_baseline,
+                    attention_mask=extended_attention_mask,
+                    use_cache=False
+                )
+                baseline_hidden = layer_outputs[0]
+                baseline_hidden = self.ea_layer.norm(baseline_hidden)
+                baseline_logits = self.ea_layer.lm_head(baseline_hidden)
+                
+                # 计算初始 Loss 和 Accuracy
+                baseline_target = shifted_target_logits
+                if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
+                    t2d_baseline = self.ea_layer.t2d.to(device)
+                    baseline_target = baseline_target[..., t2d_baseline]
+                if baseline_logits.shape[-1] != baseline_target.shape[-1]:
+                    min_v = min(baseline_logits.shape[-1], baseline_target.shape[-1])
+                    baseline_logits = baseline_logits[..., :min_v]
+                    baseline_target = baseline_target[..., :min_v]
+                
+                baseline_probs = F.softmax(baseline_target / const_temp, dim=-1)
+                baseline_log_probs = F.log_softmax(baseline_logits / const_temp, dim=-1)
+                baseline_loss = torch.nn.KLDivLoss(reduction='batchmean')(baseline_log_probs, baseline_probs) * (const_temp ** 2)
+                
+                baseline_pred = baseline_logits.argmax(dim=-1)
+                target_pred_baseline = baseline_target.argmax(dim=-1)
+                baseline_acc = (baseline_pred == target_pred_baseline).float().mean().item()
+                
+                print(f"  初始 Loss: {baseline_loss.item():.6f}")
+                print(f"  初始 Acc : {baseline_acc:.2%}")
+                print(f"  期望：训练后 Loss 应显著下降，Acc 应显著上升")
+                print(f"{'='*60}\n")
+                self.ea_layer.train()
+        
         # 这里开始训练
         total_loss = 0.0
         with torch.enable_grad():
@@ -250,20 +307,26 @@ class EaModel(nn.Module):
                 current_hidden = shifted_full_hidden
                 
                 # ========== Debug 输出 3: FC 层判断 ==========
-                print(f"\n[DEBUG Step {step+1}] FC 层检查")
-                print(f"  current_hidden.shape[-1]: {current_hidden.shape[-1]}")
-                print(f"  inputs_embeds.shape[-1]: {inputs_embeds.shape[-1]}")
-                print(f"  需要 FC? {current_hidden.shape[-1] != inputs_embeds.shape[-1]}")
+                if const_enable_debug:
+                    print(f"\n[DEBUG Step {step+1}] FC 层检查")
+                    print(f"  current_hidden.shape[-1]: {current_hidden.shape[-1]}")
+                    print(f"  inputs_embeds.shape[-1]: {inputs_embeds.shape[-1]}")
+                    print(f"  需要 FC? {current_hidden.shape[-1] != inputs_embeds.shape[-1]}")
                 
                 if current_hidden.shape[-1] != inputs_embeds.shape[-1]:
-                     current_hidden_before = current_hidden.clone()
-                     current_hidden = self.ea_layer.fc(current_hidden)
-                     print(f"  FC 前维度: {current_hidden_before.shape}")
-                     print(f"  FC 后维度: {current_hidden.shape}")
-                     print(f"  FC 权重维度: {self.ea_layer.fc.weight.shape}")
+                    if const_enable_debug:
+                        current_hidden_before = current_hidden.clone()
+                    current_hidden = self.ea_layer.fc(current_hidden)
+                    if const_enable_debug:
+                        print(f"  FC 前维度: {current_hidden_before.shape}")
+                        print(f"  FC 后维度: {current_hidden.shape}")
+                        print(f"  FC 权重维度: {self.ea_layer.fc.weight.shape}")
                 else:
-                     print(f"  警告: FC 层被跳过! Hidden 和 Embedding 维度相同!")
-                print()
+                    if const_enable_debug:
+                        print(f"  警告: FC 层被跳过! Hidden 和 Embedding 维度相同!")
+                
+                if const_enable_debug:
+                    print()
 
                 # 3. Mask (Causal)
                 batch_size, seq_len, _ = inputs_embeds.shape
@@ -286,67 +349,76 @@ class EaModel(nn.Module):
                 draft_logits = self.ea_layer.lm_head(draft_hidden_out)
                 
                 # ========== Debug 输出 4: Logits 分布检查 ==========
-                print(f"[DEBUG Step {step+1}] Logits 检查")
-                print(f"  draft_logits.shape: {draft_logits.shape}")
-                print(f"  draft_logits range: [{draft_logits.min().item():.2f}, {draft_logits.max().item():.2f}], mean: {draft_logits.mean().item():.2f}")
+                if const_enable_debug:
+                    print(f"[DEBUG Step {step+1}] Logits 检查")
+                    print(f"  draft_logits.shape: {draft_logits.shape}")
+                    print(f"  draft_logits range: [{draft_logits.min().item():.2f}, {draft_logits.max().item():.2f}], mean: {draft_logits.mean().item():.2f}")
 
                 # 6. Loss Calculation
                 target_logits_step = shifted_target_logits
-                print(f"  target_logits_step.shape: {target_logits_step.shape}")
-                print(f"  target_logits_step range: [{target_logits_step.min().item():.2f}, {target_logits_step.max().item():.2f}], mean: {target_logits_step.mean().item():.2f}")
-                
-                # 如果有词表映射，进行筛选
-                print(f"\n[DEBUG Step {step+1}] Vocab Mapping 检查")
-                print(f"  has_vocab_mapping: {self.has_vocab_mapping}")
-                print(f"  draft_vocab_size: {self.draft_vocab_size}")
-                print(f"  base_vocab_size: {self.vocab_size}")
+                if const_enable_debug:
+                    print(f"  target_logits_step.shape: {target_logits_step.shape}")
+                    print(f"  target_logits_step range: [{target_logits_step.min().item():.2f}, {target_logits_step.max().item():.2f}], mean: {target_logits_step.mean().item():.2f}")
+                    
+                    # 如果有词表映射，进行筛选
+                    print(f"\n[DEBUG Step {step+1}] Vocab Mapping 检查")
+                    print(f"  has_vocab_mapping: {self.has_vocab_mapping}")
+                    print(f"  draft_vocab_size: {self.draft_vocab_size}")
+                    print(f"  base_vocab_size: {self.vocab_size}")
                 
                 if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
-                     print(f"  使用 Vocab Mapping")
-                     print(f"  valid_for_training.sum(): {valid_for_training.sum().item()} / {valid_for_training.numel()}")
+                    if const_enable_debug:
+                        print(f"  使用 Vocab Mapping")
+                        print(f"  valid_for_training.sum(): {valid_for_training.sum().item()} / {valid_for_training.numel()}")
                      
-                     # 映射 Target Logits 到 Draft 词表
-                     target_logits_step = target_logits_step[..., t2d]
+                    # 映射 Target Logits 到 Draft 词表
+                    target_logits_step = target_logits_step[..., t2d]
                      
-                     # 筛选有效位置 (valid_for_training)
-                     draft_logits_valid = draft_logits[valid_for_training]
-                     target_logits_valid = target_logits_step[valid_for_training]
+                    # 筛选有效位置 (valid_for_training)
+                    draft_logits_valid = draft_logits[valid_for_training]
+                    target_logits_valid = target_logits_step[valid_for_training]
                 else:
-                    print(f"  不使用 Vocab Mapping")
+                    if const_enable_debug:
+                        print(f"  不使用 Vocab Mapping")
                     draft_logits_valid = draft_logits
                     target_logits_valid = target_logits_step
 
                 # 确保形状匹配
-                print(f"  匹配前: draft={draft_logits_valid.shape}, target={target_logits_valid.shape}")
+                if const_enable_debug:
+                    print(f"  匹配前: draft={draft_logits_valid.shape}, target={target_logits_valid.shape}")
                 if draft_logits_valid.shape[-1] != target_logits_valid.shape[-1]:
-                     print(f"  警告: 维度不匹配，进行截断")
-                     min_v = min(draft_logits_valid.shape[-1], target_logits_valid.shape[-1])
-                     draft_logits_valid = draft_logits_valid[..., :min_v]
-                     target_logits_valid = target_logits_valid[..., :min_v]
-                print(f"  匹配后: draft={draft_logits_valid.shape}, target={target_logits_valid.shape}")
+                    if const_enable_debug:
+                        print(f"  警告: 维度不匹配，进行截断")
+                    min_v = min(draft_logits_valid.shape[-1], target_logits_valid.shape[-1])
+                    draft_logits_valid = draft_logits_valid[..., :min_v]
+                    target_logits_valid = target_logits_valid[..., :min_v]
+                if const_enable_debug:
+                    print(f"  匹配后: draft={draft_logits_valid.shape}, target={target_logits_valid.shape}")
 
                 # KL Divergence
                 target_probs = F.softmax(target_logits_valid / const_temp, dim=-1)
                 draft_log_probs = F.log_softmax(draft_logits_valid / const_temp, dim=-1)
                 
                 # ========== Debug 输出 5: 概率分布检查 ==========
-                print(f"\n[DEBUG Step {step+1}] 概率分布检查")
-                print(f"  target_probs max值: {target_probs.max(dim=-1)[0].mean().item():.4f} (应该接近1)")
-                print(f"  draft_probs max值: {torch.exp(draft_log_probs).max(dim=-1)[0].mean().item():.4f}")
-                print(f"  target top-5 概率和: {target_probs.topk(5, dim=-1)[0].sum(dim=-1).mean().item():.4f}")
-                print(f"  draft top-5 概率和: {torch.exp(draft_log_probs).topk(5, dim=-1)[0].sum(dim=-1).mean().item():.4f}")
-                
-                # 检查前3个位置的预测
-                if draft_logits_valid.shape[0] >= 3:
-                    for pos in range(min(3, draft_logits_valid.shape[0])):
-                        draft_top = draft_logits_valid[pos].argmax().item()
-                        target_top = target_logits_valid[pos].argmax().item()
-                        print(f"    位置{pos}: Draft预测={draft_top}, Target={target_top}, 匹配={draft_top==target_top}")
+                if const_enable_debug:
+                    print(f"\n[DEBUG Step {step+1}] 概率分布检查")
+                    print(f"  target_probs max值: {target_probs.max(dim=-1)[0].mean().item():.4f} (应该接近1)")
+                    print(f"  draft_probs max值: {torch.exp(draft_log_probs).max(dim=-1)[0].mean().item():.4f}")
+                    print(f"  target top-5 概率和: {target_probs.topk(5, dim=-1)[0].sum(dim=-1).mean().item():.4f}")
+                    print(f"  draft top-5 概率和: {torch.exp(draft_log_probs).topk(5, dim=-1)[0].sum(dim=-1).mean().item():.4f}")
+                    
+                    # 检查前3个位置的预测
+                    if draft_logits_valid.shape[0] >= 3:
+                        for pos in range(min(3, draft_logits_valid.shape[0])):
+                            draft_top = draft_logits_valid[pos].argmax().item()
+                            target_top = target_logits_valid[pos].argmax().item()
+                            print(f"    位置{pos}: Draft预测={draft_top}, Target={target_top}, 匹配={draft_top==target_top}")
                 
                 loss_fn = torch.nn.KLDivLoss(reduction='batchmean')
                 loss = loss_fn(draft_log_probs, target_probs)
                 loss = loss * (const_temp ** 2)
-                print(f"  KL Loss (raw): {loss.item():.6f}")
+                if const_enable_debug:
+                    print(f"  KL Loss (raw): {loss.item():.6f}")
                 
                 # ========== 调试输出 (保留关键信息) ==========
                 with torch.no_grad():
@@ -387,62 +459,65 @@ class EaModel(nn.Module):
         self.ea_layer.train(was_training)
         
         # ========== Debug 输出 6: 训练后验证 ==========
-        print(f"\n{'='*60}")
-        print(f"[DEBUG] 训练后验证（在训练数据上重新推理）")
-        with torch.no_grad():
-            self.ea_layer.eval()
-            
-            # 关键修复：清除 tree_mask，避免形状不匹配
-            # 训练结束时恢复的 tree_mask 是之前推理留下的，和当前验证数据长度不匹配
-            saved_tree_mask_for_validation = self.ea_layer.tree_mask
-            self.ea_layer.tree_mask = None
-            
-            # 重新前向传播（简化版，只看前5个位置）
-            # 关键修复：确保数据类型与模型一致
-            model_dtype = next(self.ea_layer.parameters()).dtype
-            test_tokens = shifted_input_tokens[:, :5].to(device)
-            test_hidden = shifted_full_hidden[:, :5, :].to(device).to(model_dtype)
-            test_target = shifted_target_logits[:, :5, :].to(device).to(model_dtype)
-            
-            test_embeds = self.ea_layer.embed_tokens(test_tokens)
-            if test_hidden.shape[-1] != test_embeds.shape[-1]:
-                test_hidden = self.ea_layer.fc(test_hidden)
-            
-            batch_size, seq_len, _ = test_embeds.shape
-            attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.bool)
-            extended_attention_mask = self.ea_layer._prepare_decoder_attention_mask(
-                attention_mask, (batch_size, seq_len), test_embeds, 0
-            )
-            
-            layer_outputs = self.ea_layer.midlayer(
-                input_emb=test_embeds,
-                hidden_states=test_hidden,
-                attention_mask=extended_attention_mask,
-                use_cache=False
-            )
-            test_draft_hidden = layer_outputs[0]
-            test_draft_hidden = self.ea_layer.norm(test_draft_hidden)
-            test_draft_logits = self.ea_layer.lm_head(test_draft_hidden)
-            
-            # Vocab Mapping
-            if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
-                t2d_dev = self.ea_layer.t2d.to(device)
-                test_target = test_target[..., t2d_dev]
-            
-            draft_pred = test_draft_logits[0].argmax(dim=-1).cpu().tolist()
-            target_pred = test_target[0].argmax(dim=-1).cpu().tolist()
-            matches = sum([d == t for d, t in zip(draft_pred, target_pred)])
-            
-            print(f"  前5个位置:")
-            for i in range(5):
-                match_str = "✓" if draft_pred[i] == target_pred[i] else "✗"
-                print(f"    位置{i}: Draft={draft_pred[i]:<6} Target={target_pred[i]:<6} {match_str}")
-            print(f"  训练后匹配率: {matches}/5 = {matches/5:.1%}")
-            print(f"{'='*60}\n")
-            
-            # 恢复 tree_mask
-            self.ea_layer.tree_mask = saved_tree_mask_for_validation
-            self.ea_layer.train(was_training)
+        # ⚠️ 警告：此验证会额外执行一次前向传播，增加运行时间（小规模，仅5个token）
+        # 仅在 Debug 模式下启用，正式评测时应关闭 const_enable_debug
+        if const_enable_debug:
+            print(f"\n{'='*60}")
+            print(f"[DEBUG] 训练后验证（在训练数据上重新推理）")
+            with torch.no_grad():
+                self.ea_layer.eval()
+                
+                # 关键修复：清除 tree_mask，避免形状不匹配
+                # 训练结束时恢复的 tree_mask 是之前推理留下的，和当前验证数据长度不匹配
+                saved_tree_mask_for_validation = self.ea_layer.tree_mask
+                self.ea_layer.tree_mask = None
+                
+                # 重新前向传播（简化版，只看前5个位置）
+                # 关键修复：确保数据类型与模型一致
+                model_dtype = next(self.ea_layer.parameters()).dtype
+                test_tokens = shifted_input_tokens[:, :5].to(device)
+                test_hidden = shifted_full_hidden[:, :5, :].to(device).to(model_dtype)
+                test_target = shifted_target_logits[:, :5, :].to(device).to(model_dtype)
+                
+                test_embeds = self.ea_layer.embed_tokens(test_tokens)
+                if test_hidden.shape[-1] != test_embeds.shape[-1]:
+                    test_hidden = self.ea_layer.fc(test_hidden)
+                
+                batch_size, seq_len, _ = test_embeds.shape
+                attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.bool)
+                extended_attention_mask = self.ea_layer._prepare_decoder_attention_mask(
+                    attention_mask, (batch_size, seq_len), test_embeds, 0
+                )
+                
+                layer_outputs = self.ea_layer.midlayer(
+                    input_emb=test_embeds,
+                    hidden_states=test_hidden,
+                    attention_mask=extended_attention_mask,
+                    use_cache=False
+                )
+                test_draft_hidden = layer_outputs[0]
+                test_draft_hidden = self.ea_layer.norm(test_draft_hidden)
+                test_draft_logits = self.ea_layer.lm_head(test_draft_hidden)
+                
+                # Vocab Mapping
+                if self.has_vocab_mapping and self.draft_vocab_size < self.vocab_size:
+                    t2d_dev = self.ea_layer.t2d.to(device)
+                    test_target = test_target[..., t2d_dev]
+                
+                draft_pred = test_draft_logits[0].argmax(dim=-1).cpu().tolist()
+                target_pred = test_target[0].argmax(dim=-1).cpu().tolist()
+                matches = sum([d == t for d, t in zip(draft_pred, target_pred)])
+                
+                print(f"  前5个位置:")
+                for i in range(5):
+                    match_str = "✓" if draft_pred[i] == target_pred[i] else "✗"
+                    print(f"    位置{i}: Draft={draft_pred[i]:<6} Target={target_pred[i]:<6} {match_str}")
+                print(f"  训练后匹配率: {matches}/5 = {matches/5:.1%}")
+                print(f"{'='*60}\n")
+                
+                # 恢复 tree_mask
+                self.ea_layer.tree_mask = saved_tree_mask_for_validation
+                self.ea_layer.train(was_training)
 
         return total_loss / train_steps
 
@@ -633,13 +708,14 @@ class EaModel(nn.Module):
                 collected_logits.append(prefill_logits)
                 
                 # ========== Debug 输出: Prefill 数据收集 ==========
-                print(f"\n[DEBUG] Prefill 数据收集")
-                print(f"  prefill_tokens.shape: {prefill_tokens.shape}")
-                print(f"  prefill_hidden_states.shape: {prefill_hidden_states.shape}")
-                print(f"  prefill_logits.shape: {prefill_logits.shape}")
-                print(f"  前5个Token: {prefill_tokens[0, :5].tolist()}")
-                print(f"  Hidden维度确认: {prefill_hidden_states.shape[-1]} (EAGLE-3应为12288, EAGLE-1/2应为4096)")
-                print()
+                if const_enable_debug:
+                    print(f"\n[DEBUG] Prefill 数据收集")
+                    print(f"  prefill_tokens.shape: {prefill_tokens.shape}")
+                    print(f"  prefill_hidden_states.shape: {prefill_hidden_states.shape}")
+                    print(f"  prefill_logits.shape: {prefill_logits.shape}")
+                    print(f"  前5个Token: {prefill_tokens[0, :5].tolist()}")
+                    print(f"  Hidden维度确认: {prefill_hidden_states.shape[-1]} (EAGLE-3应为12288, EAGLE-1/2应为4096)")
+                    print()
 
         # ==========================================
 
@@ -682,14 +758,31 @@ class EaModel(nn.Module):
         # 这样比依赖 initialize_tree 的返回值更稳健（且保证在 CPU 上，与 collected_hiddens 匹配）
         if is_collecting:
              # prefill_hidden_states shape: [1, seq_len, hidden_dim]
-             last_step_hidden = prefill_hidden_states[:, -1:, :]
+            last_step_hidden = prefill_hidden_states[:, -1:, :]
         else:
-             last_step_hidden = None
+            last_step_hidden = None
 
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         
         adaptation_loss = 0.0
+        
+        # === 特殊情况：warmup_steps=0，仅对 Prefill 训练 ===
+        if is_collecting and warmup_steps == 0:
+            if const_enable_debug:
+                print(f"\n[DEBUG] warmup_steps=0，仅对 Prefill 数据训练")
+                print(f"  Prefill 数据: {collected_tokens[0].shape[1]} 个 Token")
+            
+            adaptation_loss = self._perform_online_adaptation(
+                all_accepted_tokens=collected_tokens[0],
+                all_hidden_states=collected_hiddens[0],
+                all_target_logits=collected_logits[0],
+                train_steps=const_train_steps,
+            )
+            
+            is_collecting = False  # 停止收集
+            if const_enable_debug:
+                print(f"[Online Adaptation] Prefill-only loss={adaptation_loss:.4f}\n")
         
         for idx in range(max_length):
             with torch.no_grad():
@@ -713,64 +806,73 @@ class EaModel(nn.Module):
             
             # === 数据收集逻辑 ===
             if is_collecting and total_steps < warmup_steps:
-                 # 获取当前 step 被接受的 tokens（包含树根）
-                 # candidates: [1, tree_nodes] -> candidates[best_candidate] 是最优路径的 token id
+                # 获取当前 step 被接受的 tokens（包含树根）
+                # candidates: [1, tree_nodes] -> candidates[best_candidate] 是最优路径的 token id
                  
-                 # step_accepted_tokens: [accept_length+1]
-                 step_accepted_tokens = candidates[best_candidate, :accept_length + 1]
+                # step_accepted_tokens: [accept_length+1]
+                step_accepted_tokens = candidates[best_candidate, :accept_length + 1]
                  
-                 # 构造对应的 Hidden States
-                 # first_hidden: 来自上一轮的 last_step_hidden (Pre-fill end or previous step end)
-                 # 确保 first_hidden 在 CPU 上（如果 last_step_hidden 维护得当，它应该是 CPU Tensor）
-                 first_hidden = last_step_hidden # [1, 1, hidden_dim*3]
-                 if first_hidden.device != torch.device('cpu'):
-                     first_hidden = first_hidden.cpu()
+                # 构造对应的 Hidden States
+                # first_hidden: 来自上一轮的 last_step_hidden (Pre-fill end or previous step end)
+                # 确保 first_hidden 在 CPU 上（如果 last_step_hidden 维护得当，它应该是 CPU Tensor）
+                first_hidden = last_step_hidden # [1, 1, hidden_dim*3]
+                if first_hidden.device != torch.device('cpu'):
+                    first_hidden = first_hidden.cpu()
                  
-                 if accept_length > 0:
-                     # rest_hidden: 从 outputs 中按路径取
-                     # 关键修复：必须根据 use_eagle3 决定提取维度，以匹配 Draft Model 的输入要求
-                     if self.use_eagle3:
-                         # EAGLE-3: 拼接最后 3 层 (12288 dim)
-                         # 注意：utils.py 中 tree_decoding 返回的 outputs 包含 hidden_states
-                         raw_tree_hidden = torch.cat(outputs.hidden_states[-3:], dim=-1)
-                     else:
-                         # EAGLE-1/2: 只用最后一层 (4096 dim)
-                         raw_tree_hidden = outputs[0]
-                     
-                     accepted_indices = retrieve_indices[best_candidate, :accept_length]
-                     rest_hidden = raw_tree_hidden[:, accepted_indices, :].cpu()
-                     step_hidden = torch.cat([first_hidden, rest_hidden], dim=1)
-                 else:
-                     step_hidden = first_hidden
-                     
-                 
-                 if step_accepted_tokens.shape[0] > 1: # 只有产生了新 token 才收集
-                     # 切掉 Root
-                     new_tokens = step_accepted_tokens[1:]
-                     new_hiddens = step_hidden[:, 1:, :]
-                     
-                     num_new = new_tokens.shape[0] # accept_length
-                     
-                     # 取出对应长度的 Logits
-                     # 关键修复: logits[i] 预测的是 candidates[i+1]
-                     # 所以对于 new_tokens[0] (即 candidates[1]), 对应的 Target Logits 是 logits[1] (预测 candidates[2])
-                     # 因此应该取 logits[1:num_new+1] 而不是 logits[:num_new]
-                     current_step_logits = logits[best_candidate, 1:num_new+1, :].unsqueeze(0).cpu()
-                     
-                     collected_tokens.append(new_tokens.cpu().unsqueeze(0))
-                     collected_hiddens.append(new_hiddens)
-                     collected_logits.append(current_step_logits)
-                     
-                     # ========== Debug 输出: Warmup Step 收集 ==========
-                     if total_steps == 0:  # 只在第一个 warmup step 打印
-                         print(f"[DEBUG] Warmup Step {total_steps} 数据收集")
-                         print(f"  new_tokens.shape: {new_tokens.shape}")
-                         print(f"  new_hiddens.shape: {new_hiddens.shape}")
-                         print(f"  current_step_logits.shape: {current_step_logits.shape}")
-                         print(f"  step_hidden维度: {step_hidden.shape} (最后一维应与Prefill一致)")
-                         print()
-                 
-                 pass
+                if accept_length > 0:
+                    # rest_hidden: 从 outputs 中按路径取
+                    # 关键修复：必须根据 use_eagle3 决定提取维度，以匹配 Draft Model 的输入要求
+                    if self.use_eagle3:
+                        # EAGLE-3: 拼接最后 3 层 (12288 dim)
+                        # 注意：utils.py 中 tree_decoding 返回的 outputs 包含 hidden_states
+                        raw_tree_hidden = torch.cat(outputs.hidden_states[-3:], dim=-1)
+                    else:
+                        # EAGLE-1/2: 只用最后一层 (4096 dim)
+                        raw_tree_hidden = outputs[0]
+                    
+                    # Bug 修复 1: 这里修改过
+                    # retrieve_indices[best_candidate, 0] 是 root
+                    # retrieve_indices[best_candidate, 1:accept_length+1] 是 [token1, ..., tokenN]
+                    # accepted_indices = retrieve_indices[best_candidate, 1:accept_length + 1]
+                    accepted_indices = retrieve_indices[best_candidate, :accept_length]
+                    rest_hidden = raw_tree_hidden[:, accepted_indices, :].cpu()
+                    step_hidden = torch.cat([first_hidden, rest_hidden], dim=1)
+                else:
+                    step_hidden = first_hidden
+                    
+                
+                if step_accepted_tokens.shape[0] > 1: # 只有产生了新 token 才收集
+                    # 切掉 Root
+                    new_tokens = step_accepted_tokens[1:]
+                    # Bug 修复 2: 这里修改过
+                    # 正确对齐：token[i] + hidden[i-1] → 预测 token[i+1]
+                    # new_hiddens = [hidden0, hidden1, ..., hiddenN-1]
+                    # new_tokens = [token1, token2, ..., tokenN]
+                    #new_hiddens = step_hidden[:, :-1, :]
+                    new_hiddens = step_hidden[:, 1:, :]
+                    
+                    num_new = new_tokens.shape[0] # accept_length
+                    
+                    # 取出对应长度的 Logits
+                    # 关键修复: logits[i] 预测的是 candidates[i+1]
+                    # 所以对于 new_tokens[0] (即 candidates[1]), 对应的 Target Logits 是 logits[1] (预测 candidates[2])
+                    # 因此应该取 logits[1:num_new+1] 而不是 logits[:num_new]
+                    current_step_logits = logits[best_candidate, 1:num_new+1, :].unsqueeze(0).cpu()
+                    
+                    collected_tokens.append(new_tokens.cpu().unsqueeze(0))
+                    collected_hiddens.append(new_hiddens)
+                    collected_logits.append(current_step_logits)
+                    
+                    # ========== Debug 输出: Warmup Step 收集 ==========
+                    if const_enable_debug and total_steps == 0:  # 只在第一个 warmup step 打印
+                        print(f"[DEBUG] Warmup Step {total_steps} 数据收集")
+                        print(f"  new_tokens.shape: {new_tokens.shape}")
+                        print(f"  new_hiddens.shape: {new_hiddens.shape}")
+                        print(f"  current_step_logits.shape: {current_step_logits.shape}")
+                        print(f"  step_hidden维度: {step_hidden.shape} (最后一维应与Prefill一致)")
+                        print()
+                
+                pass
 
             total_accept_length += accept_length
             total_steps += 1
@@ -801,19 +903,21 @@ class EaModel(nn.Module):
             if is_collecting and total_steps == warmup_steps:
                 # 拼接所有数据
                 # collected_tokens: List of [1, seq_len]
-                print(f"\n[DEBUG] Warmup 完成，准备训练")
-                print(f"  收集到的数据段数: {len(collected_tokens)}")
-                print(f"  各段长度: {[t.shape[1] for t in collected_tokens]}")
+                if const_enable_debug:
+                    print(f"\n[DEBUG] Warmup 完成，准备训练")
+                    print(f"  收集到的数据段数: {len(collected_tokens)}")
+                    print(f"  各段长度: {[t.shape[1] for t in collected_tokens]}")
                 
                 full_tokens = torch.cat(collected_tokens, dim=1)
                 full_hiddens = torch.cat(collected_hiddens, dim=1)
                 full_logits = torch.cat(collected_logits, dim=1)
                 
-                print(f"  拼接后 full_tokens.shape: {full_tokens.shape}")
-                print(f"  拼接后 full_hiddens.shape: {full_hiddens.shape}")
-                print(f"  拼接后 full_logits.shape: {full_logits.shape}")
-                print(f"  Hidden最后一维: {full_hiddens.shape[-1]}")
-                print(f"  开始训练...\n")
+                if const_enable_debug:
+                    print(f"  拼接后 full_tokens.shape: {full_tokens.shape}")
+                    print(f"  拼接后 full_hiddens.shape: {full_hiddens.shape}")
+                    print(f"  拼接后 full_logits.shape: {full_logits.shape}")
+                    print(f"  Hidden最后一维: {full_hiddens.shape[-1]}")
+                    print(f"  开始训练...\n")
                 
                 adaptation_loss = self._perform_online_adaptation(
                     all_accepted_tokens=full_tokens,
