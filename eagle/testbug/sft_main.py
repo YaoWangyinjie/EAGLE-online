@@ -49,6 +49,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 
 # ---- DeepSpeed is imported later so the script also runs without it ----------
@@ -101,8 +102,11 @@ def parse_args():
     )
 
     # Training hyper-parameters
-    parser.add_argument("--num_epochs",  type=int,   default=200,  help="Number of training epochs.")
-    parser.add_argument("--lr",          type=float, default=3e-5, help="Peak learning rate.")
+    parser.add_argument("--num_epochs",  type=int,   default=200,
+                        help="Total number of epochs to train. When resuming, this is "
+                             "still the *total* count (not additional epochs), so set it "
+                             "to start_epoch + extra_epochs you want to run.")
+    parser.add_argument("--lr",          type=float, default=1e-5, help="Peak learning rate.")
     parser.add_argument("--warmup_ratio",type=float, default=0.05, help="Fraction of total steps used for LR warmup.")
     parser.add_argument("--weight_decay",type=float, default=0.0,  help="AdamW weight decay.")
     parser.add_argument("--max_len",     type=int,   default=2048, help="Maximum sequence length (longer seqs are dropped).")
@@ -110,6 +114,19 @@ def parse_args():
     parser.add_argument("--grad_accum",  type=int,   default=2,    help="Gradient accumulation steps (ignored when using DeepSpeed config).")
     parser.add_argument("--test_split",  type=float, default=0.1,  help="Fraction of training data used as validation (only when --testpath is not given).")
     parser.add_argument("--seed",        type=int,   default=42,   help="Random seed.")
+    parser.add_argument("--train_id",    type=int,   default=0,
+                        help="Integer identifier for this training run. Used to namespace "
+                             "checkpoint directories so different runs (lr, data, etc.) "
+                             "don't overwrite each other.  e.g. --train_id 1")
+
+    # Checkpoint resume
+    parser.add_argument(
+        "--resume_from", type=str, default=None,
+        help=(
+            "Path to a checkpoint directory (e.g. checkpoints/epoch_199) to resume "
+            "from.  Pass 'auto' to automatically find the latest checkpoint in --savedir."
+        ),
+    )
 
     # Draft-vocab handling
     parser.add_argument(
@@ -315,44 +332,126 @@ class PaddingCollator:
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def find_latest_checkpoint(directory: str):
+def format_lr(lr: float) -> str:
     """
-    Scan *directory* for sub-directories matching 'state_N' that contain a
-    DeepSpeed checkpoint ('zero_to_fp32.py') and return (path, next_epoch).
-    Returns (None, 0) if no checkpoint is found.
+    Convert a float learning rate to a compact string for use in directory names.
+    Examples: 1e-5 → '1e-5',  3e-5 → '3e-5',  1.5e-4 → '1.5e-4'
     """
+    s = f"{lr:.10e}"
+    mantissa, exp = s.split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    return f"{mantissa}e{int(exp)}"
+
+
+def ckpt_prefix(train_id: int, lr: float) -> str:
+    """Return the directory-name prefix that identifies a (train_id, lr) run."""
+    return f"{train_id}_{format_lr(lr)}"
+
+
+def find_latest_checkpoint(directory: str, train_id: int = None, lr: float = None):
+    """
+    Scan *directory* for the most recent checkpoint sub-directory.
+
+    Formats recognised:
+      - Plain     : '{train_id}_{lr}_epoch_N/'  containing 'pytorch_model.bin'
+      - DeepSpeed : 'state_N/'                  containing 'zero_to_fp32.py'
+
+    When *train_id* and *lr* are given, only plain checkpoints whose prefix
+    matches ckpt_prefix(train_id, lr) are considered (e.g. '0_1e-5_epoch_*').
+
+    Returns (path, next_epoch).  next_epoch = saved_epoch + 1.
+    Returns (None, 0) when nothing matches.
+    """
+    if not os.path.isdir(directory):
+        return None, 0
+
     max_epoch = -1
+    best_path = None
+
+    prefix_filter = ckpt_prefix(train_id, lr) if (train_id is not None and lr is not None) else None
+
     for name in os.listdir(directory):
-        m = re.match(r"state_(\d+)$", name)
-        if m:
-            subdir = os.path.join(directory, name)
-            if os.path.isfile(os.path.join(subdir, "zero_to_fp32.py")):
-                max_epoch = max(max_epoch, int(m.group(1)))
+        subdir = os.path.join(directory, name)
+        if not os.path.isdir(subdir):
+            continue
+
+        # Plain checkpoint: {prefix}_epoch_N
+        m_plain = re.match(r"^(.+)_epoch_(\d+)$", name)
+        if m_plain and os.path.isfile(os.path.join(subdir, "pytorch_model.bin")):
+            prefix = m_plain.group(1)
+            epoch  = int(m_plain.group(2))
+            if prefix_filter is not None and prefix != prefix_filter:
+                continue
+            if epoch > max_epoch:
+                max_epoch = epoch
+                best_path = subdir
+            continue
+
+        # DeepSpeed checkpoint: state_N (no prefix filtering)
+        m_ds = re.match(r"^state_(\d+)$", name)
+        if m_ds and os.path.isfile(os.path.join(subdir, "zero_to_fp32.py")):
+            epoch = int(m_ds.group(1))
+            if epoch > max_epoch:
+                max_epoch = epoch
+                best_path = subdir
+
     if max_epoch < 0:
         return None, 0
-    return os.path.join(directory, f"state_{max_epoch}"), max_epoch + 1
+    return best_path, max_epoch + 1
 
 
-def save_16bit(model_engine, savedir: str, epoch: int):
-    """Save a 16-bit model checkpoint (DeepSpeed save_16bit_model)."""
-    path = os.path.join(savedir, f"state_{epoch}")
-    os.makedirs(path, exist_ok=True)
-    model_engine.save_16bit_model(path, exclude_frozen_parameters=True)
-    return path
-
-
-def save_plain_checkpoint(model: nn.Module, savedir: str, epoch: int):
+def save_plain_checkpoint(
+    model: nn.Module,
+    savedir: str,
+    epoch: int,
+    train_id: int = 0,
+    lr: float = 3e-5,
+    optimizer=None,
+    scaler=None,
+    scheduler=None,
+    config_src: str = None,
+):
     """
-    Save a plain PyTorch checkpoint (for non-DeepSpeed single-GPU training).
-    Only saves the *trainable* parameters.
+    Save a plain PyTorch checkpoint (non-DeepSpeed single-GPU training).
+
+    Directory name: '{train_id}_{lr}_epoch_{epoch}'
+    e.g.  '0_1e-5_epoch_19'  for train_id=0, lr=1e-5, epoch 19.
+
+    Files saved inside the directory:
+      config.json        – copied from config_src (required by EaModel.from_pretrained)
+      pytorch_model.bin  – trainable parameters + buffers (d2t, t2d)
+      optimizer.pt       – optimizer state  (if provided)
+      scaler.pt          – GradScaler state (if provided)
+      scheduler.pt       – LR scheduler state (if provided)
     """
-    path = os.path.join(savedir, f"epoch_{epoch}")
+    dirname = f"{ckpt_prefix(train_id, lr)}_epoch_{epoch}"
+    path = os.path.join(savedir, dirname)
     os.makedirs(path, exist_ok=True)
-    trainable_state = {k: v for k, v in model.state_dict().items() if v.requires_grad}
-    # also save non-parameter buffers (d2t, t2d)
-    for k, v in model.named_buffers():
-        trainable_state[k] = v
-    torch.save(trainable_state, os.path.join(path, "pytorch_model.bin"))
+
+    # config.json is required by EaModel.from_pretrained; copy it from the
+    # original EAGLE model directory so the checkpoint is self-contained.
+    if config_src is not None:
+        src = os.path.join(config_src, "config.json")
+        dst = os.path.join(path, "config.json")
+        if os.path.isfile(src) and not os.path.isfile(dst):
+            shutil.copy(src, dst)
+
+    # Use named_parameters() to identify trainable keys; state_dict() tensors
+    # are always detached so their requires_grad flag is meaningless.
+    trainable_keys = {name for name, p in model.named_parameters() if p.requires_grad}
+    model_state = {k: v for k, v in model.state_dict().items() if k in trainable_keys}
+    for k, v in model.named_buffers():   # also persist d2t, t2d for inference
+        model_state[k] = v
+
+    torch.save(model_state, os.path.join(path, "pytorch_model.bin"))
+
+    if optimizer is not None:
+        torch.save(optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
+    if scaler is not None:
+        torch.save(scaler.state_dict(), os.path.join(path, "scaler.pt"))
+    if scheduler is not None:
+        torch.save(scheduler.state_dict(), os.path.join(path, "scheduler.pt"))
+
     return path
 
 
@@ -384,12 +483,12 @@ def main():
         num_epochs=args.num_epochs,
         num_workers=2,
         max_len=args.max_len,
-        gradient_checkpoint=True,
+        gradient_checkpointing=True,
     )
 
-    cache_dir = args.cache_dir or args.savedir
+    cache_dir = args.cache_dir or args.savedir  # only used when --rescan_vocab
     os.makedirs(args.savedir, exist_ok=True)
-    os.makedirs(cache_dir,    exist_ok=True)
+    os.makedirs(cache_dir,    exist_ok=True)    # safe even if same as savedir
 
     # ------------------------------------------------------------------
     # Tokenizer
@@ -424,57 +523,54 @@ def main():
     model  = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
 
     # ------------------------------------------------------------------
-    # Draft-vocab cache (d2t / t2d)
-    # ------------------------------------------------------------------
-    cache_file = os.path.join(cache_dir, "cache.pt")
-    if args.rescan_vocab:
-        print("[sft_main] --rescan_vocab set: rebuilding draft-vocab cache from training data.")
-        if os.path.exists(cache_file):
-            os.remove(cache_file)
-        # Temporarily monkey-patch cache path used by Model.scandata
-        orig_cwd = os.getcwd()
-        os.chdir(cache_dir)
-        model.scandata(args.trainpath, args.basepath)
-        os.chdir(orig_cwd)
-    elif os.path.exists(cache_file):
-        print(f"[sft_main] Loading existing draft-vocab cache from {cache_file}")
-        cache = torch.load(cache_file)
-        model.register_buffer("d2t", cache["d2t"])
-        model.register_buffer("t2d", cache["t2d"])
-    else:
-        # Try to load from the pre-trained EAGLE model directory
-        eagle_cache = os.path.join(args.eaglepath, "cache.pt")
-        if os.path.exists(eagle_cache):
-            print(f"[sft_main] Loading draft-vocab cache from EAGLE model dir: {eagle_cache}")
-            cache = torch.load(eagle_cache)
-            model.register_buffer("d2t", cache["d2t"])
-            model.register_buffer("t2d", cache["t2d"])
-            # Also copy to cache_dir for future runs
-            torch.save(cache, cache_file)
-        else:
-            # Last resort: rebuild from training data
-            print("[sft_main] No existing cache found. Building from training data (may misalign lm_head).")
-            orig_cwd = os.getcwd()
-            os.chdir(cache_dir)
-            model.scandata(args.trainpath, args.basepath)
-            os.chdir(orig_cwd)
-
-    # ------------------------------------------------------------------
     # Load pre-trained EAGLE3 draft weights
+    # (d2t / t2d buffers live inside pytorch_model.bin, NOT in a separate
+    #  cache.pt – load them first so lm_head stays perfectly aligned)
     # ------------------------------------------------------------------
     eagle_weights_path = os.path.join(args.eaglepath, "pytorch_model.bin")
     print(f"[sft_main] Loading pre-trained EAGLE3 weights from {eagle_weights_path}")
     eagle_state = torch.load(eagle_weights_path, map_location="cpu")
 
-    # Filter out frozen components (embed_tokens, d2t, t2d) which will be
-    # overwritten by the base model / cache anyway.
+    if args.rescan_vocab:
+        # Explicitly asked to rebuild the vocab mapping from the new dataset.
+        # WARNING: this invalidates the pre-trained lm_head weights because the
+        # token index ordering will change.
+        print("[sft_main] --rescan_vocab: rebuilding d2t/t2d from training data.")
+        cache_file = os.path.join(cache_dir, "cache.pt")
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+        orig_cwd = os.getcwd()
+        os.chdir(cache_dir)
+        model.scandata(args.trainpath, args.basepath)
+        os.chdir(orig_cwd)
+        # Exclude d2t/t2d from the weight load so the freshly scanned values win
+        eagle_state = {k: v for k, v in eagle_state.items() if k not in ("d2t", "t2d")}
+    else:
+        # Default: take d2t/t2d directly from the pre-trained bin file.
+        # This keeps lm_head weights valid (they were trained with this vocab mapping).
+        if "d2t" in eagle_state and "t2d" in eagle_state:
+            print("[sft_main] Loading d2t/t2d vocab mapping from pre-trained EAGLE3 weights.")
+            model.register_buffer("d2t", eagle_state["d2t"])
+            model.register_buffer("t2d", eagle_state["t2d"])
+        else:
+            raise RuntimeError(
+                "d2t/t2d not found in pre-trained weights. "
+                "Pass --rescan_vocab to rebuild them from the training data."
+            )
+
+    # Load trainable parameters (skip embed_tokens – already loaded from base model)
     filtered_state = {
         k: v for k, v in eagle_state.items()
-        if not k.startswith("embed_tokens") and k not in ("d2t", "t2d")
+        if not k.startswith("embed_tokens")
     }
     missing, unexpected = model.load_state_dict(filtered_state, strict=False)
-    print(f"[sft_main]   missing keys  : {missing}")
-    print(f"[sft_main]   unexpected keys: {unexpected}")
+    # embed_tokens is expected missing (frozen, already set by Model.__init__)
+    expected_missing = [k for k in missing if "embed_tokens" in k or k in ("d2t", "t2d")]
+    real_missing     = [k for k in missing if k not in expected_missing]
+    if real_missing:
+        print(f"[sft_main] WARNING – unexpected missing keys: {real_missing}")
+    else:
+        print("[sft_main] Pre-trained weights loaded successfully.")
 
     # ------------------------------------------------------------------
     # DataLoaders
@@ -528,6 +624,9 @@ def main():
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
         )
+        # GradScaler for AMP: target model outputs float16 hidden_states, trainable
+        # layers are float32 – autocast handles the dtype boundary automatically.
+        scaler = torch.cuda.amp.GradScaler()
         model_engine = model  # alias for uniform code below
 
     # ------------------------------------------------------------------
@@ -550,7 +649,58 @@ def main():
             print(f"[sft_main] Resuming DeepSpeed checkpoint from {ckpt_path}")
             model_engine.load_checkpoint(ckpt_path)
     else:
-        start_epoch = 0  # plain training resumes manually if needed
+        # Resolve the checkpoint path to resume from
+        resume_path = None
+        if args.resume_from == "auto":
+            resume_path, start_epoch = find_latest_checkpoint(
+                args.savedir, train_id=args.train_id, lr=args.lr
+            )
+            if resume_path:
+                print(f"[sft_main] Auto-detected latest checkpoint: {resume_path}  (start_epoch={start_epoch})")
+            else:
+                print("[sft_main] No existing checkpoint found in savedir, starting from scratch.")
+                start_epoch = 0
+        elif args.resume_from is not None:
+            resume_path = args.resume_from
+            # Infer start_epoch from directory name: anything ending in _epoch_N
+            m = re.search(r"_epoch_(\d+)$", resume_path.rstrip("/"))
+            start_epoch = int(m.group(1)) + 1 if m else 0
+            print(f"[sft_main] Resuming from {resume_path}  (start_epoch={start_epoch})")
+        else:
+            start_epoch = 0
+
+        if resume_path is not None:
+            ckpt_model = os.path.join(resume_path, "pytorch_model.bin")
+            if not os.path.isfile(ckpt_model):
+                raise FileNotFoundError(f"Checkpoint model weights not found: {ckpt_model}")
+
+            print(f"[sft_main]   Loading model weights from {ckpt_model}")
+            ckpt_state = torch.load(ckpt_model, map_location=device)
+            # Load only the keys that exist in the current model (buffers + trainable params)
+            model.load_state_dict(ckpt_state, strict=False)
+
+            ckpt_opt = os.path.join(resume_path, "optimizer.pt")
+            if os.path.isfile(ckpt_opt):
+                print(f"[sft_main]   Loading optimizer state from {ckpt_opt}")
+                optimizer.load_state_dict(torch.load(ckpt_opt, map_location="cpu"))
+            else:
+                print("[sft_main]   optimizer.pt not found – LR schedule will restart.")
+
+            ckpt_scaler = os.path.join(resume_path, "scaler.pt")
+            if os.path.isfile(ckpt_scaler):
+                print(f"[sft_main]   Loading scaler state from {ckpt_scaler}")
+                scaler.load_state_dict(torch.load(ckpt_scaler, map_location="cpu"))
+
+            ckpt_sched = os.path.join(resume_path, "scheduler.pt")
+            if os.path.isfile(ckpt_sched):
+                print(f"[sft_main]   Loading scheduler state from {ckpt_sched}")
+                scheduler.load_state_dict(torch.load(ckpt_sched, map_location="cpu"))
+            else:
+                # Fast-forward scheduler to the correct step without optimizer.pt
+                steps_done = start_epoch * len(train_loader) // args.grad_accum
+                for _ in range(steps_done):
+                    scheduler.step()
+                print(f"[sft_main]   scheduler.pt not found – fast-forwarded {steps_done} steps.")
 
     # ------------------------------------------------------------------
     # Training loop
@@ -574,11 +724,19 @@ def main():
             else:
                 rank_device = device
 
-            plosses, _, acces = model_engine(
-                input_ids=data["input_ids"].to(rank_device),
-                attention_mask=data["attention_mask"].to(rank_device),
-                loss_mask=data["loss_mask"],
-            )
+            if use_deepspeed:
+                plosses, _, acces = model_engine(
+                    input_ids=data["input_ids"].to(rank_device),
+                    attention_mask=data["attention_mask"].to(rank_device),
+                    loss_mask=data["loss_mask"],
+                )
+            else:
+                with torch.cuda.amp.autocast():
+                    plosses, _, acces = model_engine(
+                        input_ids=data["input_ids"].to(rank_device),
+                        attention_mask=data["attention_mask"].to(rank_device),
+                        loss_mask=data["loss_mask"],
+                    )
 
             loss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses)))
 
@@ -586,10 +744,12 @@ def main():
                 model_engine.backward(loss)
                 model_engine.step()
             else:
-                (loss / args.grad_accum).backward()
+                scaler.scale(loss / args.grad_accum).backward()
                 if (batch_idx + 1) % args.grad_accum == 0:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
 
@@ -626,11 +786,19 @@ def main():
                 else:
                     rank_device = device
 
-                plosses, _, acces = model_engine(
-                    input_ids=data["input_ids"].to(rank_device),
-                    attention_mask=data["attention_mask"].to(rank_device),
-                    loss_mask=data["loss_mask"],
-                )
+                if use_deepspeed:
+                    plosses, _, acces = model_engine(
+                        input_ids=data["input_ids"].to(rank_device),
+                        attention_mask=data["attention_mask"].to(rank_device),
+                        loss_mask=data["loss_mask"],
+                    )
+                else:
+                    with torch.cuda.amp.autocast():
+                        plosses, _, acces = model_engine(
+                            input_ids=data["input_ids"].to(rank_device),
+                            attention_mask=data["attention_mask"].to(rank_device),
+                            loss_mask=data["loss_mask"],
+                        )
                 epoch_plosses_val = [epoch_plosses_val[i] + [plosses[i].item()] for i in range(len(plosses))]
                 epoch_acces_val   = [epoch_acces_val[i]   + [acces[i]]          for i in range(len(acces))]
 
@@ -654,7 +822,15 @@ def main():
                         model_engine, save_dir=os.path.join(args.savedir, f"state_{epoch}")
                     )
             else:
-                ckpt = save_plain_checkpoint(model, args.savedir, epoch)
+                ckpt = save_plain_checkpoint(
+                    model, args.savedir, epoch,
+                    train_id=args.train_id,
+                    lr=args.lr,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    scheduler=scheduler,
+                    config_src=args.eaglepath,
+                )
             if global_rank == 0:
                 print(f"  → Saved checkpoint: {ckpt}")
 
