@@ -40,7 +40,7 @@ import random
 
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
 # ---------------------------------------------------------------------------
@@ -169,23 +169,30 @@ def generate_answer(
         tokenize=False,
         add_generation_prompt=True,
     )
-    input_ids = tokenizer(
+    # Explicitly request attention_mask to suppress the pad==eos warning
+    encoding = tokenizer(
         prompt, return_tensors="pt", add_special_tokens=False
-    ).input_ids.to(device)
+    )
+    input_ids      = encoding.input_ids.to(device)
+    attention_mask = encoding.attention_mask.to(device)
 
-    # Generation kwargs
-    gen_kwargs = dict(
-        input_ids=input_ids,
+    # Build GenerationConfig to avoid the "flags not valid" warning in
+    # transformers >= 4.50, where temperature/top_p must be passed via
+    # GenerationConfig rather than as direct kwargs to model.generate().
+    gen_config = GenerationConfig(
         max_new_tokens=max_new_tokens,
         do_sample=(temperature > 0.0),
+        temperature=temperature if temperature > 0.0 else 1.0,
+        top_p=top_p if temperature > 0.0 else 1.0,
         pad_token_id=tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
-    if temperature > 0.0:
-        gen_kwargs["temperature"] = temperature
-        gen_kwargs["top_p"] = top_p
 
-    output_ids = model.generate(**gen_kwargs)
+    output_ids = model.generate(
+        input_ids,
+        attention_mask=attention_mask,
+        generation_config=gen_config,
+    )
 
     # Decode only the newly generated tokens (strip the prompt)
     new_token_ids = output_ids[0, input_ids.shape[1]:]
