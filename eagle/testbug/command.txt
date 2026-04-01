@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=0 python gen_sft_data.py \
+    --num_samples_per_question 1 \
+    --temperature 0.0 \
+
+CUDA_VISIBLE_DEVICES=0 python sft_main.py \
+    --num_epochs 200 \
+    --lr 1e-5 \
+    --save_every 20 \
+    --train_id 0 \
+    --resume_from auto \
+
+CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
+    --sft_eagle checkpoints/0_1e-5_epoch_199
