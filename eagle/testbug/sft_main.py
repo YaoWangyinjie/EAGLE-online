@@ -181,118 +181,133 @@ from configs import EConfig
 # Dataset utilities
 # ---------------------------------------------------------------------------
 
-def _apply_chat_template_no_last_assistant(tokenizer, messages: list) -> str:
+def build_loss_mask_from_raw(
+    tokenizer,
+    input_ids: torch.Tensor,
+    raw_prompts: list,
+    raw_answers: list,
+) -> torch.Tensor:
     """
-    Return the tokenized string up to (but NOT including) the last assistant reply.
-    Used to compute instruction_len for building the loss mask.
+    Build a 0/1 loss mask using the EXACT prompt strings saved by gen_sft_data.py.
+
+    The conversation token sequence is:  prompt_0 + answer_0 + eos
+                                       + prompt_1 + answer_1 + eos
+                                       + ...
+    We mask prompt tokens as 0 and answer tokens as 1, so the draft model only
+    learns to predict assistant tokens (no leakage from question/instruction).
+
+    This avoids the chat-template round-trip that silently drops the <think>
+    generation-prompt suffix, which would shift the loss mask by ~3 tokens.
     """
-    # Drop the last assistant turn to get the "prompt only" prefix
-    prefix_messages = messages[:-1]
-    return tokenizer.apply_chat_template(
-        prefix_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    loss_mask = torch.zeros_like(input_ids)
+    eos_id    = tokenizer.eos_token_id
+    cursor    = 0
 
+    for prompt_str, answer_str in zip(raw_prompts, raw_answers):
+        # Prompt section – mask = 0
+        prompt_ids = tokenizer(
+            prompt_str, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+        prompt_len = len(prompt_ids)
 
-def build_loss_mask(tokenizer, conversation_str: str, messages: list) -> torch.Tensor:
-    """
-    Build a 0/1 loss mask of the same length as the tokenised conversation.
+        # Answer section – mask = 1
+        # The answer was decoded; re-encode it to get exact token count.
+        answer_ids = tokenizer(
+            answer_str, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+        answer_len = len(answer_ids)
 
-    Strategy
-    --------
-    For each assistant turn we:
-      1. Tokenise the full conversation up to AND including that turn.
-      2. Tokenise the conversation up to the start of that turn (instruction prefix).
-      3. Mask everything before the assistant's reply as 0; the reply itself is 1.
+        # Mark answer tokens as training targets
+        ans_start = cursor + prompt_len
+        ans_end   = ans_start + answer_len
+        if ans_end <= len(loss_mask):
+            loss_mask[ans_start:ans_end] = 1
 
-    This approach is tokenizer-agnostic and handles arbitrary chat templates
-    (LLaMA-3 <|eot_id|>, DeepSeek <｜end▁of▁sentence｜>, etc.).
-    """
-    full_ids = tokenizer(
-        conversation_str, return_tensors="pt", add_special_tokens=False
-    ).input_ids[0]
-    loss_mask = torch.zeros_like(full_ids)
-
-    # Walk the messages and identify each assistant block
-    assistant_role = "assistant"
-    prefix_msgs = []
-    for msg in messages:
-        if msg["role"] == assistant_role:
-            # Prefix = everything up to this assistant turn (with generation prompt)
-            prefix_str = _apply_chat_template_no_last_assistant(
-                tokenizer, prefix_msgs + [msg]
-            )
-            prefix_ids = tokenizer(
-                prefix_str, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
-            prefix_len = len(prefix_ids)
-
-            # Full conversation through this assistant turn (no generation prompt)
-            through_msgs = prefix_msgs + [msg]
-            through_str = tokenizer.apply_chat_template(
-                through_msgs, tokenize=False, add_generation_prompt=False
-            )
-            through_ids = tokenizer(
-                through_str, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
-            through_len = len(through_ids)
-
-            # The assistant reply occupies [prefix_len, through_len)
-            if through_len <= len(full_ids):
-                loss_mask[prefix_len:through_len] = 1
-
-        prefix_msgs.append(msg)
+        # Advance past prompt + answer + eos token
+        cursor = ans_end + 1  # +1 for the eos that the template appends
 
     return loss_mask
 
 
+def build_conversation_str_from_raw(raw_prompts: list, raw_answers: list, eos_token: str) -> str:
+    """
+    Reconstruct the EXACT conversation text as seen by the target model during
+    generation, by concatenating:  prompt_i + answer_i + eos  for each turn.
+
+    This matches the original generation exactly, including the '<think>\\n'
+    suffix that the generation prompt injects before the model's output.
+    """
+    parts = []
+    for prompt_str, answer_str in zip(raw_prompts, raw_answers):
+        parts.append(prompt_str + answer_str + eos_token)
+    return "".join(parts)
+
+
 def build_dataset(tokenizer, datapath: str, max_len: int, seed: int):
     """
-    Load a ShareGPT-format JSONL and return a HuggingFace Dataset with
-    fields: input_ids (1, T), attention_mask (1, T), loss_mask (1, T).
+    Load a ShareGPT-format JSONL (extended with raw_prompts / raw_answers fields
+    written by gen_sft_data.py) and return a HuggingFace Dataset with fields:
+      input_ids (1, T), attention_mask (1, T), loss_mask (1, T).
+
+    If raw_prompts / raw_answers are present the conversation string is
+    reconstructed directly from them (exact token match with generation time).
+    Otherwise the function falls back to the chat-template reconstruction
+    path for compatibility with plain ShareGPT data.
     """
     ds = hf_load_dataset("json", data_files=datapath)["train"]
     ds = ds.shuffle(seed=seed)
     original_columns = ds.column_names
 
+    eos_token = tokenizer.eos_token or ""
+
     def preprocess(examples):
         result = {"input_ids": [], "attention_mask": [], "loss_mask": []}
+        n = len(examples["id"])
 
-        for i in range(len(examples["id"])):
-            source = examples["conversations"][i]
-            if not source:
-                continue
+        has_raw = "raw_prompts" in examples and examples["raw_prompts"][0] is not None
 
-            # Convert ShareGPT roles to standard roles
-            role_map = {"human": "user", "gpt": "assistant", "system": "system"}
-            messages = []
-            for turn in source:
-                role = role_map.get(turn["from"], turn["from"])
-                messages.append({"role": role, "content": turn["value"]})
+        for i in range(n):
+            if has_raw:
+                # ---- Preferred path: exact reconstruction ------------------
+                raw_prompts = examples["raw_prompts"][i]
+                raw_answers = examples["raw_answers"][i]
+                conversation_str = build_conversation_str_from_raw(
+                    raw_prompts, raw_answers, eos_token
+                )
+                input_ids = tokenizer(
+                    conversation_str, return_tensors="pt", add_special_tokens=False
+                ).input_ids[0]
+                if len(input_ids) > max_len:
+                    continue
+                loss_mask = build_loss_mask_from_raw(
+                    tokenizer, input_ids, raw_prompts, raw_answers
+                )
+            else:
+                # ---- Fallback: chat-template reconstruction ----------------
+                source = examples["conversations"][i]
+                if not source:
+                    continue
+                role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+                messages = [{"role": role_map.get(t["from"], t["from"]),
+                             "content": t["value"]} for t in source]
+                if messages and messages[0]["role"] != "user":
+                    messages = messages[1:]
+                if not messages:
+                    continue
+                conversation_str = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                input_ids = tokenizer(
+                    conversation_str, return_tensors="pt", add_special_tokens=False
+                ).input_ids[0]
+                if len(input_ids) > max_len:
+                    continue
+                # Fallback loss mask: mark all non-zero positions as 1
+                # (rough approximation; use raw_prompts path for accuracy)
+                loss_mask = torch.ones_like(input_ids)
 
-            # Ensure the conversation starts with a user turn
-            if messages and messages[0]["role"] != "user":
-                messages = messages[1:]
-            if not messages:
-                continue
-
-            # Apply the model's own chat template
-            conversation_str = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
-            )
-
-            input_ids = tokenizer(
-                conversation_str, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
-
-            if len(input_ids) > max_len:
-                continue  # drop sequences that are too long
-
-            loss_mask = build_loss_mask(tokenizer, conversation_str, messages)
             attention_mask = torch.ones_like(input_ids)
-
-            result["input_ids"].append(input_ids[None, :])        # (1, T)
+            result["input_ids"].append(input_ids[None, :])
             result["attention_mask"].append(attention_mask[None, :])
             result["loss_mask"].append(loss_mask[None, :])
 
