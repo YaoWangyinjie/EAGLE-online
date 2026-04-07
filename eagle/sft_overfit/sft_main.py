@@ -112,7 +112,7 @@ def parse_args():
     parser.add_argument("--max_len",     type=int,   default=2048, help="Maximum sequence length (longer seqs are dropped).")
     parser.add_argument("--batch_size",  type=int,   default=1,    help="Per-GPU micro batch size.")
     parser.add_argument("--grad_accum",  type=int,   default=2,    help="Gradient accumulation steps (ignored when using DeepSpeed config).")
-    parser.add_argument("--test_split",  type=float, default=0.1,  help="Fraction of training data used as validation (only when --testpath is not given).")
+    parser.add_argument("--test_split",  type=float, default=0.0,  help="Fraction of training data used as validation (only when --testpath is not given). Set to 0 to use all data for training.")
     parser.add_argument("--seed",        type=int,   default=42,   help="Random seed.")
     parser.add_argument("--train_id",    type=int,   default=0,
                         help="Integer identifier for this training run. Used to namespace "
@@ -545,7 +545,7 @@ def main():
     if args.testpath:
         train_dataset = full_dataset
         test_dataset  = build_dataset(tokenizer, args.testpath, args.max_len, args.seed)
-    else:
+    elif args.test_split > 0:
         n_test  = max(1, int(len(full_dataset) * args.test_split))
         n_train = len(full_dataset) - n_test
         train_dataset, test_dataset = random_split(
@@ -553,6 +553,10 @@ def main():
             generator=torch.Generator().manual_seed(args.seed),
         )
         print(f"[sft_main]   → train={n_train}  test={n_test}  (test_split={args.test_split})")
+    else:
+        train_dataset = full_dataset
+        test_dataset  = None
+        print(f"[sft_main]   → train={len(full_dataset)}  test=0  (test_split disabled)")
 
     # ------------------------------------------------------------------
     # Model
@@ -620,7 +624,7 @@ def main():
         local_rank  = deepspeed.comm.get_local_rank()
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True)
-        test_sampler  = DistributedSampler(test_dataset,  num_replicas=world_size, rank=global_rank, shuffle=False)
+        test_sampler  = DistributedSampler(test_dataset,  num_replicas=world_size, rank=global_rank, shuffle=False) if test_dataset is not None else None
     else:
         global_rank = 0
         local_rank  = 0
@@ -637,7 +641,7 @@ def main():
         test_dataset, batch_size=args.batch_size,
         sampler=test_sampler, shuffle=False,
         num_workers=2, pin_memory=True, collate_fn=collator,
-    )
+    ) if test_dataset is not None else None
 
     # ------------------------------------------------------------------
     # Optimizer & LR scheduler (plain training path)
@@ -814,41 +818,42 @@ def main():
                     wandb.log({f"train/epoch_ploss_{i}": mean_ploss, f"train/epoch_acc_{i}": mean_acc})
 
         # ---- validation --------------------------------------------------
-        model.eval()
-        epoch_plosses_val = [[] for _ in range(model.length)]
-        epoch_acces_val   = [[] for _ in range(model.length)]
+        if test_loader is not None:
+            model.eval()
+            epoch_plosses_val = [[] for _ in range(model.length)]
+            epoch_acces_val   = [[] for _ in range(model.length)]
 
-        with torch.no_grad():
-            for data in tqdm(test_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [eval]"):
-                if use_deepspeed:
-                    rank_device = local_rank
-                else:
-                    rank_device = device
+            with torch.no_grad():
+                for data in tqdm(test_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [eval]"):
+                    if use_deepspeed:
+                        rank_device = local_rank
+                    else:
+                        rank_device = device
 
-                if use_deepspeed:
-                    plosses, _, acces = model_engine(
-                        input_ids=data["input_ids"].to(rank_device),
-                        attention_mask=data["attention_mask"].to(rank_device),
-                        loss_mask=data["loss_mask"],
-                    )
-                else:
-                    with torch.cuda.amp.autocast():
+                    if use_deepspeed:
                         plosses, _, acces = model_engine(
                             input_ids=data["input_ids"].to(rank_device),
                             attention_mask=data["attention_mask"].to(rank_device),
                             loss_mask=data["loss_mask"],
                         )
-                epoch_plosses_val = [epoch_plosses_val[i] + [plosses[i].item()] for i in range(len(plosses))]
-                epoch_acces_val   = [epoch_acces_val[i]   + [acces[i]]          for i in range(len(acces))]
+                    else:
+                        with torch.cuda.amp.autocast():
+                            plosses, _, acces = model_engine(
+                                input_ids=data["input_ids"].to(rank_device),
+                                attention_mask=data["attention_mask"].to(rank_device),
+                                loss_mask=data["loss_mask"],
+                            )
+                    epoch_plosses_val = [epoch_plosses_val[i] + [plosses[i].item()] for i in range(len(plosses))]
+                    epoch_acces_val   = [epoch_acces_val[i]   + [acces[i]]          for i in range(len(acces))]
 
-        for i in range(model.length):
-            mean_ploss = np.mean(epoch_plosses_val[i]) if epoch_plosses_val[i] else float("nan")
-            mean_acc   = np.mean(epoch_acces_val[i])   if epoch_acces_val[i]   else float("nan")
-            if global_rank == 0:
-                print(f"  Val   Epoch {epoch+1:>4} | pos {i} | ploss={mean_ploss:.4f} | acc={mean_acc:.4f}")
-                if args.use_wandb:
-                    import wandb
-                    wandb.log({f"val/epoch_ploss_{i}": mean_ploss, f"val/epoch_acc_{i}": mean_acc})
+            for i in range(model.length):
+                mean_ploss = np.mean(epoch_plosses_val[i]) if epoch_plosses_val[i] else float("nan")
+                mean_acc   = np.mean(epoch_acces_val[i])   if epoch_acces_val[i]   else float("nan")
+                if global_rank == 0:
+                    print(f"  Val   Epoch {epoch+1:>4} | pos {i} | ploss={mean_ploss:.4f} | acc={mean_acc:.4f}")
+                    if args.use_wandb:
+                        import wandb
+                        wandb.log({f"val/epoch_ploss_{i}": mean_ploss, f"val/epoch_acc_{i}": mean_acc})
 
         torch.cuda.empty_cache()
 
