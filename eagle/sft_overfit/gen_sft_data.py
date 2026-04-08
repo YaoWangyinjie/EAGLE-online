@@ -253,8 +253,12 @@ def generate_answer(
     input_ids      = encoding.input_ids.to(device)
     attention_mask = encoding.attention_mask.to(device)
 
+    model_max_len = getattr(model.config, "max_position_embeddings", 16384)
+    prompt_len = input_ids.shape[1]
+    effective_max_new_tokens = min(max_new_tokens, model_max_len - prompt_len - 1)
+
     gen_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=effective_max_new_tokens,
         do_sample=(temperature > 0.0),
         temperature=temperature if temperature > 0.0 else 1.0,
         top_p=top_p if temperature > 0.0 else 1.0,
