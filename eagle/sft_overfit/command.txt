@@ -25,6 +25,9 @@ CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
     --run_tag epoch199 \
 
 进度：
-1.mt_bench先前训练使用的生成答案最大tokens数1024太短，现在采用4096在重新生成
+1.mt_bench先前训练使用的生成答案最大tokens数1024太短，采用16384重新生成仍有12条截断
 2.humaneval过滤出的没有截断的有63条，实际训练的57条有点少
 3.EAGLE_online部分检查<think>的问题
+4.怀疑是think链相似等原因，sum等数据集效果明显更好，尝试qa/alpaca
+5.做小语种数据集，找法律/类似的文学数据集
+6.写pipeline，正常推理->发现al下降->分割train set，选取若干条query微调训练
