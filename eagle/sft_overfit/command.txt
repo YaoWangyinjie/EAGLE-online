@@ -25,9 +25,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
     --run_tag epoch199 \
 
 进度：
-1.mt_bench先前训练使用的生成答案最大tokens数1024太短，采用16384重新生成仍有12条截断
-2.humaneval过滤出的没有截断的有63条，实际训练的57条有点少
-3.EAGLE_online部分检查<think>的问题
-4.怀疑是think链相似等原因，sum等数据集效果明显更好，尝试qa/alpaca
-5.做小语种数据集，找法律/类似的文学数据集
-6.写pipeline，正常推理->发现al下降->分割train set，选取若干条query微调训练
+1.sum,qa效果好 有待测试：alpaca （可能是think链相似的原因）
+2.将已有数据集翻译成小语种 有待测试：sum-威尔士语，阿姆哈拉语，蒙古语 目前发现翻译质量差，直接换现有数据集
+3.寻找其他小众的可能有效领域：CNN/DailyMail XL-Sum GovReport BillSum MeQSum MLSUM ECtHR EURLEX LexGLUE （法律，文学）
+4.写pipeline，正常推理->发现al下降->分割train set，选取若干条query微调训练
