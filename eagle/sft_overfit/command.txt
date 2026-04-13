@@ -29,3 +29,4 @@ CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
 2.用download_dataset.py下载测试小语种数据集
 3.用download_dataset.py下载文学/法律等小众领域数据集：CNN/DailyMail XL-Sum GovReport BillSum MeQSum MLSUM ECtHR EURLEX LexGLUE
 4.写pipeline，正常推理->发现al下降->分割train set，选取若干条query微调训练
+6.小语种数据集的训练数据目前仍然是英文回答的，后续换成小语种语言重新测试
