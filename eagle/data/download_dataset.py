@@ -51,6 +51,18 @@ def conv_pubmed(row, qid):
     }
 
 
+def conv_arxiv(row, qid):
+    """ArXiv papers: article → abstract (smaller download than pubmed)."""
+    article = row["article"].strip()
+    abstract = row["abstract"].strip()
+    return {
+        "question_id": qid,
+        "category": "scientific_summarization",
+        "turns": [f"Summarize the following paper:\n\n{article}"],
+        "reference": [abstract],
+    }
+
+
 def conv_pubmed_qa(row, qid):
     """PubMedQA: biomedical yes/no/maybe question answering."""
     context = " ".join(row["context"]["contexts"])
@@ -85,10 +97,18 @@ DATASETS = {
         "output_dir": "billsum",
     },
     "pubmed": {
+        # streaming=True avoids downloading the full 3.6GB file
         "loader": lambda: load_dataset("scientific_papers", "pubmed", split="test",
-                                       trust_remote_code=True),
+                                       streaming=True, trust_remote_code=True),
         "converter": conv_pubmed,
         "output_dir": "pubmed",
+    },
+    "arxiv": {
+        # ArXiv split of same dataset (~1.3GB) — use streaming to avoid timeout
+        "loader": lambda: load_dataset("scientific_papers", "arxiv", split="test",
+                                       streaming=True, trust_remote_code=True),
+        "converter": conv_arxiv,
+        "output_dir": "arxiv",
     },
     "pubmed_qa": {
         "loader": lambda: load_dataset("pubmed_qa", "pqa_labeled", split="train"),
@@ -98,7 +118,8 @@ DATASETS = {
     **{
         f"xlsum_{lang}": {
             "loader": (lambda l: lambda: load_dataset(
-                "csebuetnlp/xlsum", l, split="test"))(lang),
+                "csebuetnlp/xlsum", l, split="test",
+                trust_remote_code=True))(lang),
             "converter": (lambda l: lambda row, qid: conv_xlsum(row, qid, l))(lang),
             "output_dir": f"xlsum_{lang}",
         }
@@ -127,11 +148,20 @@ def main():
     cfg = DATASETS[args.dataset]
     print(f"Loading {args.dataset} ...")
     ds = cfg["loader"]()
-    print(f"  Raw size: {len(ds)}")
 
-    # optional shuffle
-    if args.shuffle:
-        ds = ds.shuffle(seed=42)
+    # IterableDataset (streaming) vs regular Dataset
+    from datasets import IterableDataset
+    is_streaming = isinstance(ds, IterableDataset)
+
+    if is_streaming:
+        # streaming: shuffle with buffer, no len()
+        if args.shuffle:
+            ds = ds.shuffle(seed=42, buffer_size=1000)
+        print(f"  Streaming mode (no total size known)")
+    else:
+        print(f"  Raw size: {len(ds)}")
+        if args.shuffle:
+            ds = ds.shuffle(seed=42)
 
     converter = cfg["converter"]
     out_dir = os.path.join(os.path.dirname(__file__), cfg["output_dir"])
