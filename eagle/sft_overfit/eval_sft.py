@@ -106,6 +106,7 @@ def parse_args():
     parser.add_argument("--depth",          type=int,   default=5,    help="Maximum draft depth.")
     parser.add_argument("--top_k",          type=int,   default=10,   help="Top-k at each draft step.")
     parser.add_argument("--max_new_tokens", type=int,   default=1024, help="Maximum generated tokens per turn.")
+    parser.add_argument("--max_len",        type=int,   default=2048, help="KV cache size (prompt + generated tokens). Increase for long sequences.")
     parser.add_argument("--num_warmup",     type=int,   default=3,    help="Number of warmup generations before timing.")
 
     # Run mode
@@ -289,6 +290,7 @@ def evaluate_model(
             temperature=args.temperature,
             log=True,
             is_llama3=True,
+            max_length=args.max_len,
         )
     torch.cuda.synchronize()
     print("[eval_sft] Warmup done.")
@@ -326,6 +328,7 @@ def evaluate_model(
                 temperature=args.temperature,
                 log=True,
                 is_llama3=True,
+                max_length=args.max_len,
             )
             output_ids, new_token, idx = ret[0], ret[1], ret[2]
 
