@@ -23,6 +23,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
     --sft_only \
     --baseline_only \
     --run_tag epoch199 \
+    --max_len 4096 \
 
 进度：
 1.sum,qa,alpaca效果好（可能是think链相似的原因）
