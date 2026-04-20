@@ -9,6 +9,7 @@ CUDA_VISIBLE_DEVICES=0 python gen_sft_data.py \
 
 CUDA_VISIBLE_DEVICES=0 python sft_main.py \
     --dataset humaneval \
+    --num_train_queries 10 \
     --num_epochs 200 \
     --lr 1e-5 \
     --save_every 20 \
@@ -16,6 +17,7 @@ CUDA_VISIBLE_DEVICES=0 python sft_main.py \
     --resume_from auto \
     --trainpath data/humaneval_sft_v1.jsonl \
     --max_len 4096 \
+（未设置训练query数量时默认全训练）
 
 CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
     --dataset humaneval \
@@ -24,6 +26,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_sft.py \
     --baseline_only \
     --run_tag epoch199 \
     --max_len 4096 \
+（评估时解析checkpoints文件夹后缀，对未被加入训练的query做评估）
 
 进度：
 1.sum,qa,alpaca效果好（可能是think链相似的原因）
