@@ -150,6 +150,11 @@ def parse_args():
 
     # Dataset namespacing
     parser.add_argument(
+        "--num_train_queries", type=int, default=None,
+        help="If set, use only the first N queries (in file order, no shuffle) for training. "
+             "The checkpoint directory will have _{N} appended, e.g. checkpoints/billsum_10/. "
+             "Omit to train on all queries (default behaviour, with shuffle).")
+    parser.add_argument(
         "--dataset", type=str, default=None,
         help=(
             "Dataset name (e.g. 'mt_bench', 'humaneval', 'math'). "
@@ -171,9 +176,13 @@ def parse_args():
         # Auto-derive trainpath: sft_overfit/data/{dataset}_sft.jsonl
         if not any(a.startswith("--trainpath") for a in argv):
             args.trainpath = os.path.join(script_dir, "data", f"{args.dataset}_sft.jsonl")
-        # Auto-derive savedir: sft_overfit/checkpoints/{dataset}
+        # Auto-derive savedir: sft_overfit/checkpoints/{dataset} or checkpoints/{dataset}_{N}
         if not any(a.startswith("--savedir") for a in argv):
-            args.savedir = os.path.join(script_dir, "checkpoints", args.dataset)
+            if args.num_train_queries is not None:
+                args.savedir = os.path.join(script_dir, "checkpoints",
+                                            f"{args.dataset}_{args.num_train_queries}")
+            else:
+                args.savedir = os.path.join(script_dir, "checkpoints", args.dataset)
 
     return args
 
@@ -267,7 +276,8 @@ def build_conversation_str_from_raw(raw_prompts: list, raw_answers: list, eos_to
     return "".join(parts)
 
 
-def build_dataset(tokenizer, datapath: str, max_len: int, seed: int):
+def build_dataset(tokenizer, datapath: str, max_len: int, seed: int,
+                  num_queries: int = None):
     """
     Load a ShareGPT-format JSONL (extended with raw_prompts / raw_answers fields
     written by gen_sft_data.py) and return a HuggingFace Dataset with fields:
@@ -279,7 +289,13 @@ def build_dataset(tokenizer, datapath: str, max_len: int, seed: int):
     path for compatibility with plain ShareGPT data.
     """
     ds = hf_load_dataset("json", data_files=datapath)["train"]
-    ds = ds.shuffle(seed=seed)
+    if num_queries is not None:
+        # Take first N records in file order (no shuffle) for partial-training experiment
+        n = min(num_queries, len(ds))
+        ds = ds.select(range(n))
+        print(f"[build_dataset] Partial training: using first {n}/{len(ds)+n} queries (no shuffle)")
+    else:
+        ds = ds.shuffle(seed=seed)
     original_columns = ds.column_names
 
     eos_token = tokenizer.eos_token or ""
@@ -539,7 +555,8 @@ def main():
     # Dataset
     # ------------------------------------------------------------------
     print(f"[sft_main] Building dataset from {args.trainpath}")
-    full_dataset = build_dataset(tokenizer, args.trainpath, args.max_len, args.seed)
+    full_dataset = build_dataset(tokenizer, args.trainpath, args.max_len, args.seed,
+                                 num_queries=args.num_train_queries)
     print(f"[sft_main]   → {len(full_dataset)} samples after filtering")
 
     if args.testpath:
