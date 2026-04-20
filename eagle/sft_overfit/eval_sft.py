@@ -162,6 +162,24 @@ class QuestionResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def parse_train_subset_from_path(checkpoint_path: str):
+    """
+    Detect partial-training experiments by looking for a numeric suffix in the
+    checkpoint folder name, e.g.  .../checkpoints/billsum_10/0_1e-5_epoch_199
+    returns 10.  Returns None if no such suffix is found.
+
+    Handles dataset names that already contain underscores (xlsum_welsh_10).
+    """
+    import re
+    if not checkpoint_path:
+        return None
+    for part in reversed(checkpoint_path.replace("\\", "/").split("/")):
+        m = re.match(r'^.+_(\d+)$', part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def load_questions(question_file: str, q_begin=None, q_end=None) -> list:
     questions = []
     with open(question_file, "r") as f:
@@ -501,6 +519,15 @@ def main():
 
     questions = load_questions(args.question_file, args.question_begin, args.question_end)
     print(f"[eval_sft] Loaded {len(questions)} questions from {args.question_file}")
+
+    # Auto-detect partial-training experiment: if --sft_eagle path contains _{N},
+    # skip the first N questions so we evaluate only on the held-out portion.
+    n_train = parse_train_subset_from_path(args.sft_eagle)
+    if n_train is not None and n_train < len(questions):
+        print(f"[eval_sft] Detected partial-training experiment (N={n_train}). "
+              f"Skipping first {n_train} questions; evaluating on questions[{n_train}:] "
+              f"({len(questions) - n_train} questions).")
+        questions = questions[n_train:]
 
     tag = f"__{args.run_tag}" if args.run_tag else ""
 
