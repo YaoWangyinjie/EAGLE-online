@@ -1,0 +1,296 @@
+EAGLE-online 项目改动、运行方式、实验结果与后续计划
+更新时间：2026-09-14
+
+一、项目目标
+==========
+本项目研究使用在线训练（test-time/online adaptation）优化 EAGLE 投机解码。EAGLE 由基础语言模型（target/base model）和 EAGLE draft model 组成：基础模型负责验证候选 token，EAGLE 模型负责生成候选 token。项目的核心问题是：在推理过程中利用当前输入和 speculative decoding 轨迹，对 EAGLE draft 参数做轻量更新，使后续候选更接近基础模型，从而提高 acceptance rate、平均 accepted length 和推理吞吐。
+
+必须区分三个指标：
+1. acceptance rate：accepted tokens / drafted tokens。
+2. avg accepted length：accepted tokens / speculative steps。
+3. throughput：生成 token 数 / 总耗时。在线训练会增加总耗时，因此 acceptance 提升不一定意味着端到端速度提升。
+
+二、代码版本和改动范围
+======================
+1. eagle/model/ea_model_new.py
+   早期在线适应版本。曾用于发现和修复在线更新后的 cache 生命周期问题。主要包括 fragment 收集、KL/acceptance surrogate 训练和更新后 cache 重建。该版本不是当前推荐版本。
+
+2. eagle/model/ea_model_1.py
+   基于 ea_model_new.py 整理出的稳定版本，保留原有推理流程并加入稳定性修复。主要改动：
+   - EAGLE-3 使用最后三个 hidden states，并检查拼接宽度。
+   - 修正 token、hidden、target logits 的对齐，使用 tokens[:, 1:]、hidden[:, :-1]、target logits[:, :-1]。
+   - 检查 target/draft vocabulary 映射是否合法。
+   - 检查静态 KV cache 容量，避免 append/copy 越界。
+   - speculative transaction 在容量不足时停止，不进行不安全的部分截断。
+   - adaptation 更新后清空 EA KV、base cache、tree_mask、tree_mode，再重新建立 tree。
+   - 训练使用 float32，检查 loss、gradient、parameter、optimizer state 是否有限。
+   - 更新失败时恢复参数并清理 cache。
+   - 支持 reset/persistent、参数 scope 和 KL/acceptance 类训练目标的初步配置。
+
+3. eagle/model/ea_model_2.py
+   当前实验使用的版本，复制 ea_model_1 后继续扩展。主要能力：
+   - 参数范围：default、head_only、fc_only、midlayer_only、norm_only、lm_head_only。
+   - head_only 只更新 norm.* 和 lm_head.*，embed_tokens 保持冻结。
+   - 目标：kl、acceptance、acceptance_weighted_kl。
+   - adaptation mode：reset、persistent。
+   - reset/cache 粒度：choice、turn、stream；evaluator 的 request 选项会映射到安全的 choice 初始化语义。
+   - 默认学习率 1e-5；长线实验显式使用 1e-6 或 1e-5。
+   - gradient clip、relative drift、anchor weight 等参数可配置。
+   - 更新后执行 base cache reset 和 inference cache invalidation。
+   - 通过显式关键字参数修正 from_pretrained 的 EA 配置路径传递，避免将 config.json 和 EA 模型目录混淆。
+   - 需要注意：当前 EA2 已运行的 persistent 版本仍然是“当前问题 fragment 的连续单步 KL 更新 + 权重/Adam 跨问题保留”，不是完整滑动窗口 replay 系统。
+
+
+四、三种核心运行模式
+====================
+A. no-update：纯推理 baseline
+-----------------------------
+完全关闭在线学习，不创建 adaptation optimizer，不收集训练 fragment，不计算 adaptation loss，不反向传播，不更新 EA 权重，也没有 Adam adaptation state。它不是“只不持续更新”，而是完全不进行在线训练。
+
+B. reset：问题内在线适应、边界恢复
+----------------------------------
+问题生成过程中允许收集 fragment 并做梯度更新；问题/choice 结束后恢复初始 EA 权重，重建 optimizer，清空 Adam state，并清理 inference cache。因此它适合测试“单个问题内部更新是否有帮助”，不会把一个问题的适应结果带给下一个问题。
+
+C. persistent：长线在线适应
+---------------------------
+问题结束后不恢复 EA 权重，也不重置 Adam。下一个问题从上一个问题更新后的权重和 Adam state 开始继续训练。推理 cache 仍会在更新后清理并重建；保留的是参数和 optimizer state，不是旧 KV cache。
+
+当前 persistent 的真实策略：
+- 每个问题收集 prefill/tree decoding fragment；
+- 进行当前实现允许的一次或少量 KL 更新；
+- 成功后保留权重和 Adam state；
+- 历史 fragment 当前不会通过 bounded replay/sliding window 重新采样。
+
+因此当前 persistent 不是回归拟合，也不是滑动窗口训练。长期风险是最近样本偏置、领域遗忘和参数漂移。后续应加入 bounded replay、recent+anchor replay、EMA acceptance、validation guard 和自动 rollback。
+
+五、EA2 evaluator 运行方式
+==========================
+必须在项目目录执行模块方式运行：
+cd /root/paddlejob/workspace/env_run/yw/EAGLE-online
+python -m eagle.evaluation.gen_ea_answer_ea2 ...
+
+DeepSeek-R1-Distill-Llama-8B 和 EAGLE3 权重绝对路径示例：
+BASE=/root/paddlejob/workspace/env_run/yw/new-eagle/model_weight/DeepSeek-R1-Distill-Llama-8B
+EA=/root/paddlejob/workspace/env_run/yw/new-eagle/model_weight/EAGLE3-DeepSeek-R1-Distill-LLaMA-8B
+
+最小 baseline 示例：
+CUDA_VISIBLE_DEVICES=0 python -m eagle.evaluation.gen_ea_answer_ea2 \
+  --base-model-path "$BASE" --ea-model-path "$EA" \
+  --question-file eagle/data/mt_bench/question.jsonl \
+  --answer-file /root/paddlejob/workspace/env_run/yw/EAGLE-online/results/mtbench_noupdate.jsonl \
+  --model-id ea2 --max-new-token 1024 --no-update \
+  --experiment-name mtbench_noupdate
+
+reset 示例：
+CUDA_VISIBLE_DEVICES=0 python -m eagle.evaluation.gen_ea_answer_ea2 \
+  --base-model-path "$BASE" --ea-model-path "$EA" \
+  --question-file eagle/data/mt_bench/question.jsonl \
+  --answer-file /root/paddlejob/workspace/env_run/yw/EAGLE-online/results/mtbench_reset_lr1e-5.jsonl \
+  --model-id ea2 --max-new-token 1024 \
+  --weight-mode reset --cache-scope choice --scope head_only \
+  --objective kl --adaptation-lr 1e-5 \
+  --gradient-clip-norm .2 --anchor-weight 1e-3 \
+  --experiment-name mtbench_reset_lr1e-5
+
+persistent 示例：
+CUDA_VISIBLE_DEVICES=0 python -m eagle.evaluation.gen_ea_answer_ea2 \
+  --base-model-path "$BASE" --ea-model-path "$EA" \
+  --question-file eagle/data/mt_bench/question.jsonl \
+  --answer-file /root/paddlejob/workspace/env_run/yw/EAGLE-online/results/mtbench_persistent_lr1e-6.jsonl \
+  --model-id ea2 --max-new-token 1024 \
+  --weight-mode persistent --cache-scope stream --scope head_only \
+  --objective kl --adaptation-lr 1e-6 \
+  --gradient-clip-norm .2 --anchor-weight 1e-3 \
+  --experiment-name mtbench_persistent_lr1e-6
+
+六、主要命令行参数
+==================
+模型和数据：
+--base-model-path       基础模型目录，必需
+--ea-model-path         EAGLE 模型目录，必需
+--question-file         question.jsonl，默认 MT-Bench
+--answer-file           输出答案路径，必需；不要复用已有 stem
+--model-id              结果中的模型名，必需
+--question-begin/end    题目切片范围
+
+生成：
+--max-new-token         每轮最大生成 token，默认 1024
+--total-token           tree/cache token 配置，默认 60
+--depth                 tree depth，默认 5
+--top-k                 tree top-k，默认 10
+--temperature           生成温度，默认 0.0
+
+在线适应：
+--no-update             完全关闭在线训练
+--adaptation-lr         学习率，例如 1e-5、1e-6
+--adaptation-temperature adaptation 温度
+--scope                 default/head_only/fc_only/midlayer_only/norm_only/lm_head_only
+--objective             kl/acceptance/acceptance_weighted_kl
+--weight-mode           reset/persistent
+--cache-scope           request/turn/choice/stream
+--gradient-clip-norm    梯度裁剪阈值
+--max-relative-drift    相对参数漂移上限
+--anchor-weight         anchor 正则系数（当前实现暴露了配置；完整 anchor/replay 机制仍需继续完善）
+--experiment-name       实验名，必须能表达配置
+
+推荐命名规则：
+数据集_模式_学习率[_其他关键参数]
+例如：
+- billsum_noupdate：BillSum，无在线更新
+- billsum_reset_lr1e-5：BillSum，reset，1e-5
+- billsum_persistent：BillSum，persistent，之前使用 1e-6
+- billsum_persistent_lr1e-5：BillSum，persistent，1e-5
+- mtbench_reset_lr1e-5：MT-Bench，reset，1e-5
+- mtbench_persistent_lr1e-5：MT-Bench，persistent，1e-5
+
+文件通常包括：
+<stem>.jsonl       生成答案
+<stem>_stats.jsonl 每条问题/turn 的统计
+<stem>_stat.txt    汇总信息
+日志位于本轮实验的 /root/paddlejob/workspace/env_run/yw/EAGLE-online/results/<stem>.log。
+
+七、已经完成的实验和位置
+========================
+本轮 EA2 结果全部位于项目目录下的：
+/root/paddlejob/workspace/env_run/yw/EAGLE-online/results/
+
+results/ 同时保存本轮实验结果和日志文件。
+
+四个数据集均完成了 no-update、reset lr=1e-5、persistent lr=1e-6、persistent lr=1e-5。
+
+结果文件名：
+BillSum：
+- billsum_noupdate_stats.jsonl
+- billsum_reset_lr1e-5_stats.jsonl
+- billsum_persistent_stats.jsonl（persistent，lr=1e-6）
+- billsum_persistent_lr1e-5_stats.jsonl
+
+PubMedQA：
+- pubmedqa_noupdate_stats.jsonl
+- pubmedqa_reset_lr1e-5_stats.jsonl
+- pubmedqa_persistent_stats.jsonl（persistent，lr=1e-6）
+- pubmedqa_persistent_lr1e-5_stats.jsonl
+
+PubMed：
+- pubmed_noupdate_stats.jsonl
+- pubmed_reset_lr1e-5_stats.jsonl
+- pubmed_persistent_stats.jsonl（persistent，lr=1e-6）
+- pubmed_persistent_lr1e-5_stats.jsonl
+
+MT-Bench：
+- mtbench_noupdate_stats.jsonl
+- mtbench_reset_lr1e-5_stats.jsonl
+- mtbench_persistent_stats.jsonl（persistent，lr=1e-6）
+- mtbench_persistent_lr1e-5_stats.jsonl
+
+日志目录：
+/root/paddlejob/workspace/env_run/yw/EAGLE-online/results/
+
+历史 EA1/旧 evaluator 的 MT-Bench 结果位于：
+/root/paddlejob/workspace/env_run/yw/EAGLE-online/ds_mt_bench_online/
+包括：
+- 3-temperature-0.0_stats.jsonl：旧版 baseline
+- 3-online-temperature-0.0_stats.jsonl：旧版在线适应
+- gpu0_lr1e-5_stats.jsonl：学习率实验
+- gpu1_scope_head_only_stats.jsonl：参数范围实验
+- gpu2_reset_turn_stats.jsonl：reset 粒度实验
+- gpu3_objective_acceptance_stats.jsonl：acceptance surrogate 实验
+
+八、完整实验结果
+================
+指标均为本轮 EA2 stats 汇总：
+
+BillSum：
+- no-update：acceptance 52.825%，avg length 3.6803，94.91 tok/s
+- reset 1e-5：52.694%，3.6701，82.68 tok/s
+- persistent 1e-6：52.722%，3.6718，80.67 tok/s
+- persistent 1e-5：52.479%，3.6585，80.50 tok/s
+结论：两种在线模式均未超过 baseline；1e-5 persistent 最差。
+
+PubMedQA：
+- no-update：52.500%，3.6575，96.19 tok/s
+- reset 1e-5：52.513%，3.6595，92.64 tok/s
+- persistent 1e-6：52.728%，3.6744，93.32 tok/s
+- persistent 1e-5：52.490%，3.6593，93.97 tok/s
+结论：persistent 1e-6 最好，acceptance 比 baseline 高 0.228 个百分点，但提升很小；1e-5 收益消失。
+
+PubMed：
+- no-update：49.369%，3.4250，89.17 tok/s
+- reset 1e-5：49.458%，3.4340，77.61 tok/s
+- persistent 1e-6：49.465%，3.4322，76.52 tok/s
+- persistent 1e-5：49.374%，3.4320，78.43 tok/s
+结论：acceptance 只有极小提升，训练成本明显，不适合无条件长线更新。
+
+MT-Bench：
+- no-update：61.730%，4.3078，107.94 tok/s
+- reset 1e-5：61.811%，4.3141，104.72 tok/s
+- persistent 1e-6：61.876%，4.3186，103.93 tok/s
+- persistent 1e-5：61.362%，4.2827，101.99 tok/s
+结论：persistent 1e-6 最好；persistent 1e-5 明显退化。
+
+九、MT-Bench 类别结果
+====================
+persistent 1e-6 相对 no-update 的 acceptance 变化：
+- writing：+1.186 个百分点
+- coding：+1.496 个百分点
+- stem：+0.921 个百分点
+- extraction：+0.260 个百分点
+- math：-0.140 个百分点
+- humanities：-0.363 个百分点
+- roleplay：-0.612 个百分点
+- reasoning：-0.938 个百分点
+
+reset 1e-5 相对 no-update：
+- writing -0.149，roleplay -0.183，reasoning -0.258，math +0.470
+- coding +0.317，extraction +0.483，stem +0.597，humanities -0.040
+
+persistent 1e-5 相对 no-update：
+- writing -0.115，roleplay +0.183，reasoning -0.499，math +0.460
+- coding -0.190，extraction +0.081，stem -0.637，humanities -1.300
+
+每类只有 20 个问题，上述结果是趋势，不是显著性结论。当前 evaluator 还没有完善保存 prompt token length、cumulative context length、adaptation time 等字段，因此长度分桶分析暂不充分。
+
+十、总体结论
+============
+1. cache 生命周期修复有效，四个数据集、四种主要配置均可稳定运行。
+2. no-update 是本轮 EA2 的纯推理 baseline，不应再表述为“缺 baseline”。
+3. 在线训练会增加成本；acceptance 微小提升不一定转化为端到端吞吐提升。
+4. persistent 不是天然优于 reset，只有在低学习率和较匹配的数据流上才可能有小收益。
+5. persistent lr=1e-5 明显不如 lr=1e-6，说明长期累积更新对学习率非常敏感。
+6. PubMedQA 和 MT-Bench 是当前最值得继续研究的对象；BillSum 当前不支持 persistent；PubMed 收益过小。
+7. MT-Bench 中可能受益的是 writing、coding、stem、extraction；reasoning、roleplay、humanities 需要保护，但样本量不足。
+8. 当前最稳健的生产/推理配置仍是 no-update。研究型长线配置可从 head_only + KL + persistent + lr=1e-6 开始。
+
+十一、已知限制和接下来可做什么
+==============================
+当前 EA2 persistent 尚未完整实现：
+- bounded replay/sliding window；
+- recent + anchor replay；
+- 完整 anchor regularization；
+- EMA acceptance/loss 监控；
+- validation guard；
+- acceptance drop 自动 rollback/pause；
+- category gating；
+- rejected candidate 保存和真正的 margin objective；
+- prompt/context/output length 的完整统计；
+- 多 seed 和 paired bootstrap 显著性分析。
+
+推荐后续顺序：
+1. 补充 prompt length、output length、adaptation time、weight version、cache epoch 等统计字段。
+2. 对 MT-Bench 做 qid + category + turn + length 的逐问题 paired 分析。
+3. 重复至少 3 个 seed，报告均值、标准差和 paired confidence interval。
+4. 加入 bounded replay：当前 fragment 与少量历史 fragment 混合训练。
+5. 加入 anchor loss 和 drift/acceptance guard；失败则 rollback。
+6. 实现 category-gated adaptation，只对稳定受益流量启用 persistent。
+7. 只有确认收益稳定后，再尝试更复杂的 rejected-candidate margin loss。
+
+十二、快速查阅表
+================
+想知道是否在线训练：看 experiment name 和命令中的 --no-update。
+想知道是否跨问题保留：看 weight-mode；persistent 保留，reset 不保留。
+想知道学习率：看文件名中的 lr1e-5/lr1e-6；旧的 persistent 文件名不带 lr，但本轮约定为 lr=1e-6。
+想知道 reset 粒度：看 cache-scope；本轮 reset 使用 choice。
+想知道参数范围：看 scope；本轮 persistent/reset 主要使用 head_only。
+想知道目标：看 objective；本轮主要使用 kl。
+想知道完整统计：读取 /root/paddlejob/workspace/env_run/yw/EAGLE-online/results/<stem>_stats.jsonl。
+想知道运行日志：读取 /root/paddlejob/workspace/env_run/yw/EAGLE-online/results/<stem>.log。
