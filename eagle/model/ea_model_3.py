@@ -72,16 +72,11 @@ class EaModel(_EaModel2):
         self.long_term_setup_generation = int(getattr(self, "long_term_setup_generation", 0)) + 1
         self.long_term_committed_version = int(getattr(self, "weight_version", 0))
         self.long_term_last_update_drift = 0.0
-        self.long_term_bad_streak = 0
-        self.long_term_max_bad_streak = 3
         self.long_term_updates = 0
         self.long_term_rollbacks = 0
         self.long_term_ema_loss = None
         self.long_term_ema_acceptance = None
         self.long_term_ema_decay = 0.95
-        self.long_term_loss_bad_streak = 0
-        self.long_term_acceptance_bad_streak = 0
-        self.long_term_max_bad_streak = 3
         # EA2 enforces this limit for each optimizer step; EA3 applies the
         # same configured limit to cumulative drift from the immutable anchor.
         self.max_relative_drift = float(max_relative_drift)
@@ -241,24 +236,13 @@ class EaModel(_EaModel2):
             self.long_term_ema_length = float(accepted_length) if not hasattr(self, 'long_term_ema_length') or self.long_term_ema_length is None else self.long_term_ema_decay * self.long_term_ema_length + alpha * float(accepted_length)
 
     def record_acceptance(self, acceptance, accepted_length=None):
-        previous = self.long_term_ema_acceptance
+        """Record generation quality for diagnostics without changing adaptation state."""
         self.update_acceptance_ema(acceptance, accepted_length)
-        # Treat small observation-to-baseline movement as noise; require sustained degradation.
-        drop = 0.0 if previous is None else previous - float(acceptance)
-        if drop > 0.01:
-            self.long_term_acceptance_bad_streak += 1
-        else:
-            self.long_term_acceptance_bad_streak = 0
-        if self.long_term_acceptance_bad_streak >= self.long_term_max_bad_streak:
-            self.pause_adaptation("acceptance_guard")
-            return True
         return False
 
     def resume_adaptation(self):
         self.long_term_paused = False
         self.long_term_pause_reason = None
-        self.long_term_acceptance_bad_streak = 0
-        self.long_term_loss_bad_streak = 0
 
     def pause_adaptation(self, reason="manual"):
         self.long_term_paused = True
